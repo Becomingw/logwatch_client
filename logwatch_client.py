@@ -25,12 +25,15 @@ import pty
 import select
 import shutil
 import signal
+import smtplib
 import socket
 import sys
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import URLError
@@ -53,6 +56,262 @@ UPLOAD_CIRCUIT_BREAK_MINUTES = 5  # 熔断时长（分钟）
 UPLOAD_CIRCUIT_BREAK_MAX = 3  # 熔断次数达到该值后进入离线模式
 PUBLISH_GRACE_SECONDS = 1  # 发布前等待窗口（秒）
 MAX_RETRY_QUEUE = 100  # 最大重试队列大小
+
+
+# ── 邮件配置 ──────────────────────────────────────────
+
+def load_email_config(config: dict) -> Optional[dict]:
+    """从配置中加载邮件设置，返回 None 表示未配置或禁用"""
+    smtp_host = config.get("smtp_host", "").strip()
+    if not smtp_host:
+        return None
+
+    notify_on = config.get("email_notify_on", "all").lower().strip()
+    if notify_on not in ("all", "failed", "success"):
+        notify_on = "all"
+
+    return {
+        "enabled": config.get("email_enabled", "true").lower() == "true",
+        "smtp_host": smtp_host,
+        "smtp_port": int(config.get("smtp_port", "465") or "465"),
+        "smtp_user": config.get("smtp_user", "").strip(),
+        "smtp_pass": config.get("smtp_pass", "").strip(),
+        "smtp_use_tls": config.get("smtp_use_tls", "true").lower() == "true",
+        "from": config.get("email_from", "").strip(),
+        "to": config.get("email_to", "").strip(),
+        "notify_on": notify_on,  # all, failed, success
+        "notify_on_start": config.get("email_notify_on_start", "false").lower() == "true",
+    }
+
+
+def send_email(subject: str, body: str, email_config: dict, html_body: Optional[str] = None) -> tuple[bool, str]:
+    """
+    发送邮件，支持 HTML 格式
+    返回: (成功与否, 错误信息或空字符串)
+    """
+    if not email_config or not email_config.get("enabled", False):
+        return False, "邮件未启用"
+
+    recipient = email_config.get("to", "")
+    sender = email_config.get("from", "")
+    if not recipient or not sender:
+        return False, "收件人或发件人未配置"
+
+    try:
+        if html_body:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject
+            msg["From"] = sender
+            msg["To"] = recipient
+            msg.attach(MIMEText(body, "plain", "utf-8"))
+            msg.attach(MIMEText(html_body, "html", "utf-8"))
+        else:
+            msg = MIMEText(body, "plain", "utf-8")
+            msg["Subject"] = subject
+            msg["From"] = sender
+            msg["To"] = recipient
+
+        port = email_config.get("smtp_port", 465)
+        use_tls = email_config.get("smtp_use_tls", True)
+        smtp_user = email_config.get("smtp_user", "")
+        smtp_pass = email_config.get("smtp_pass", "")
+
+        if port == 465:
+            with smtplib.SMTP_SSL(email_config["smtp_host"], port, timeout=10) as server:
+                if smtp_user and smtp_pass:
+                    server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(email_config["smtp_host"], port, timeout=10) as server:
+                if use_tls:
+                    server.starttls()
+                if smtp_user and smtp_pass:
+                    server.login(smtp_user, smtp_pass)
+                server.send_message(msg)
+
+        return True, ""
+    except smtplib.SMTPAuthenticationError:
+        return False, "SMTP 认证失败，请检查用户名和密码"
+    except smtplib.SMTPConnectError:
+        return False, "无法连接 SMTP 服务器"
+    except smtplib.SMTPException as e:
+        return False, f"SMTP 错误: {e}"
+    except socket.timeout:
+        return False, "SMTP 连接超时"
+    except Exception as e:
+        return False, f"发送失败: {e}"
+
+
+# ── 邮件模板 ──────────────────────────────────────────
+
+def _format_duration(seconds: int) -> str:
+    """格式化时长"""
+    if seconds < 60:
+        return f"{seconds}s"
+    elif seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    else:
+        hours = seconds // 3600
+        mins = (seconds % 3600) // 60
+        return f"{hours}h {mins}m"
+
+
+def build_task_email(
+    task_name: str,
+    machine: str,
+    command: str,
+    status: str = "success",  # start, success, failed
+    exit_code: Optional[int] = None,
+    elapsed_seconds: Optional[int] = None,
+    tail_logs: Optional[str] = None,
+) -> tuple[str, str, str]:
+    """
+    构建任务通知邮件
+    status: start=开始执行, success=执行成功, failed=执行失败
+    返回: (subject, plain_body, html_body)
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 状态配置
+    status_map = {
+        "start": ("开始执行", "🚀", "#007aff"),
+        "success": ("执行成功", "✅", "#34c759"),
+        "failed": ("执行失败", "❌", "#ff3b30"),
+    }
+    status_text, status_emoji, status_color = status_map.get(status, status_map["success"])
+
+    subject = f"[LogWatch] {task_name} - {status_text}"
+
+    # 纯文本版本
+    plain_body = f"""LogWatch 任务通知
+{'=' * 40}
+
+状态: {status_emoji} {status_text}
+任务: {task_name}
+机器: {machine}
+命令: {command}"""
+
+    if exit_code is not None:
+        plain_body += f"\n退出码: {exit_code}"
+    if elapsed_seconds is not None:
+        plain_body += f"\n耗时: {_format_duration(elapsed_seconds)}"
+    plain_body += f"\n时间: {now}"
+
+    if tail_logs:
+        log_lines = tail_logs.strip().split('\n')[-15:]
+        plain_body += f"\n\n--- 日志尾部 ---\n" + '\n'.join(log_lines)
+
+    plain_body += f"\n{'=' * 40}\n此邮件由 LogWatch 客户端离线模式发送"
+
+    # HTML 版本 - 额外信息行
+    extra_html = ""
+    if exit_code is not None or elapsed_seconds is not None:
+        exit_html = f'<div style="flex: 1; padding: 10px 16px; border-right: 1px solid #e5e5e5;"><div style="font-size: 11px; color: #86868b;">退出码</div><div style="font-size: 14px; font-weight: 600; color: #1d1d1f;">{exit_code if exit_code is not None else "-"}</div></div>' if exit_code is not None else ""
+        duration_html = f'<div style="flex: 1; padding: 10px 16px;"><div style="font-size: 11px; color: #86868b;">耗时</div><div style="font-size: 14px; color: #1d1d1f;">{_format_duration(elapsed_seconds) if elapsed_seconds else "-"}</div></div>' if elapsed_seconds is not None else ""
+        if exit_html or duration_html:
+            extra_html = f'<div style="display: flex; border-bottom: 1px solid #e5e5e5;">{exit_html}{duration_html}</div>'
+
+    logs_html = ""
+    if tail_logs:
+        log_lines = tail_logs.strip().split('\n')[-15:]
+        escaped_logs = '\n'.join(log_lines).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        logs_html = f'<div style="margin-top: 16px;"><div style="font-size: 12px; color: #86868b; margin-bottom: 8px;">日志尾部</div><pre style="background: #2d2d2d; color: #d4d4d4; padding: 12px; border-radius: 8px; font-size: 11px; overflow-x: auto; white-space: pre-wrap; word-break: break-all;">{escaped_logs}</pre></div>'
+
+    html_body = f'''<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin: 0; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f7;">
+<div style="max-width: 500px; margin: 0 auto; background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+    <div style="padding: 20px; text-align: center;"><div style="font-size: 18px; font-weight: 600; color: #1d1d1f;">LogWatch</div></div>
+    <div style="padding: 0 20px 20px;">
+        <div style="text-align: center; margin-bottom: 16px;"><span style="display: inline-block; background: {status_color}; color: #fff; padding: 6px 16px; border-radius: 16px; font-size: 13px; font-weight: 600;">{status_text}</span></div>
+        <div style="border: 1px solid #e5e5e5; border-radius: 8px; overflow: hidden;">
+            <div style="padding: 12px 16px; border-bottom: 1px solid #e5e5e5;"><div style="font-size: 15px; font-weight: 600; color: #1d1d1f;">{task_name}</div><div style="font-size: 12px; color: #86868b; margin-top: 2px;">{machine}</div></div>
+            {extra_html}
+            <div style="padding: 10px 16px; background: #fafafa;"><div style="font-size: 11px; color: #86868b;">命令</div><div style="font-size: 12px; color: #1d1d1f; font-family: monospace; word-break: break-all;">{command[:100]}{"..." if len(command) > 100 else ""}</div></div>
+        </div>
+        {logs_html}
+    </div>
+    <div style="padding: 12px 20px; background: #f5f5f7; text-align: center;"><div style="font-size: 11px; color: #86868b;">LogWatch 客户端离线模式 · {now}</div></div>
+</div>
+</body>
+</html>'''
+
+    return subject, plain_body, html_body
+
+
+def send_task_notification_email(
+    email_config: Optional[dict],
+    task_name: str,
+    machine: str,
+    command: str,
+    exit_code: int,
+    elapsed_seconds: int,
+    log_file: Path,
+) -> None:
+    """发送任务完成的邮件通知（离线模式使用）"""
+    if not email_config or not email_config.get("enabled", False):
+        return
+
+    # 根据 notify_on 配置过滤
+    notify_on = email_config.get("notify_on", "all")
+    if notify_on == "failed" and exit_code == 0:
+        return
+    if notify_on == "success" and exit_code != 0:
+        return
+
+    # 读取日志尾部
+    tail_logs = None
+    try:
+        if log_file.exists():
+            content = log_file.read_text(errors="replace")
+            if content:
+                tail_logs = content
+    except Exception:
+        pass
+
+    status = "success" if exit_code == 0 else "failed"
+    subject, plain_body, html_body = build_task_email(
+        task_name=task_name,
+        machine=machine,
+        command=command,
+        status=status,
+        exit_code=exit_code,
+        elapsed_seconds=elapsed_seconds,
+        tail_logs=tail_logs,
+    )
+
+    success, error = send_email(subject, plain_body, email_config, html_body=html_body)
+    if success:
+        print_lw_message("邮件通知已发送", color="32")
+    else:
+        print_lw_message(f"邮件发送失败: {error}", color="33")
+
+
+def send_task_start_email(
+    email_config: Optional[dict],
+    task_name: str,
+    machine: str,
+    command: str,
+) -> None:
+    """发送任务开始的邮件通知（离线模式使用）"""
+    if not email_config or not email_config.get("enabled", False):
+        return
+    if not email_config.get("notify_on_start", False):
+        return
+
+    subject, plain_body, html_body = build_task_email(
+        task_name=task_name,
+        machine=machine,
+        command=command,
+        status="start",
+    )
+
+    success, error = send_email(subject, plain_body, email_config, html_body=html_body)
+    if success:
+        print_lw_message("开始邮件已发送", color="32")
+    else:
+        print_lw_message(f"开始邮件发送失败: {error}", color="33")
 
 
 def load_config() -> dict:
@@ -113,6 +372,45 @@ server=http://your-server.com:8000
 
 # 熔断次数达到该值后进入离线模式（可选）
 # upload_circuit_break_max=3
+
+# ── 离线邮件通知配置（可选）──────────────────────────
+# 离线模式下，任务完成后会通过邮件通知
+# 如果不需要邮件通知，保持以下配置注释即可
+
+# 强制始终使用离线模式（不上传到服务器，仅本地记录+邮件通知）
+# force_offline=false
+
+# 是否启用邮件通知（true/false）
+# email_enabled=true
+
+# 邮件通知类型：all=全部, failed=仅失败, success=仅成功
+# email_notify_on=all
+
+# 任务开始时是否发送邮件通知（true/false）
+# 注意：遵循 publish_grace_seconds 等待窗口，瞬间退出的程序不会发送
+# email_notify_on_start=false
+
+# SMTP 服务器地址（必填，启用邮件通知时）
+# smtp_host=smtp.example.com
+
+# SMTP 端口（可选，默认 465）
+# 465: SSL 加密, 587: STARTTLS, 25: 明文
+# smtp_port=465
+
+# SMTP 用户名（通常是邮箱地址）
+# smtp_user=your-email@example.com
+
+# SMTP 密码或授权码
+# smtp_pass=your-password-or-auth-code
+
+# 是否使用 TLS（可选，默认 true）
+# smtp_use_tls=true
+
+# 发件人地址
+# email_from=your-email@example.com
+
+# 收件人地址（接收通知的邮箱）
+# email_to=notify@example.com
 """
     CONFIG_PATH.write_text(template)
     print(f"配置文件已生成: {CONFIG_PATH}")
@@ -514,9 +812,12 @@ def main():
     if precheck_code != 0:
         sys.exit(precheck_code)
 
-    # 检查服务器连通性（可选）
-    offline_mode = False
-    if not args.no_check:
+    # 检查是否强制离线模式
+    force_offline = config.get("force_offline", "false").lower() == "true"
+    offline_mode = force_offline
+
+    # 检查服务器连通性（可选，非强制离线时）
+    if not offline_mode and not args.no_check:
         if not check_server_connectivity(server):
             if sys.stdin.isatty():
                 offline_mode = prompt_offline_mode()
@@ -527,6 +828,9 @@ def main():
             else:
                 print_lw_message("无法连接服务器（非交互环境），已退出", color="31")
                 sys.exit(2)
+
+    if force_offline:
+        print_lw_message("强制离线模式", color="33")
 
     # 清理旧日志（静默执行）
     try:
@@ -548,6 +852,8 @@ def main():
     uploader = None if offline_mode else LogUploader(server, task_id, log_file, user_id, config)
     uploader_started = False
     published = False
+    email_start_sent = False  # 离线模式开始邮件是否已发送
+    email_config = load_email_config(config) if offline_mode else None
 
     # 执行命令
     start_time = time.time()
@@ -600,12 +906,22 @@ def main():
             exec_ok = False
 
             def maybe_publish():
-                nonlocal published, uploader_started
-                if published or offline_mode:
-                    return
+                nonlocal published, uploader_started, email_start_sent
                 if not exec_ok:
                     return
                 if time.time() < publish_deadline:
+                    return
+
+                # 离线模式：发送开始邮件
+                if offline_mode:
+                    if not email_start_sent and email_config:
+                        send_task_start_email(email_config, task_name, machine, command_str)
+                        email_start_sent = True
+                    published = True
+                    return
+
+                # 在线模式：上传到服务器
+                if published:
                     return
                 if uploader and not uploader_started:
                     uploader.start()
@@ -732,12 +1048,27 @@ def main():
         uploader.stop()
         if uploader.is_offline():
             offline_mode = True
+            # 运行中熔断进入离线模式，需要加载邮件配置
+            if email_config is None:
+                email_config = load_email_config(config)
 
     # 上报任务结束
     event_type = "success" if exit_code == 0 else "failed"
     if published and not offline_mode:
         if not send_event(server, task_id, user_id, event_type, task_name, machine, command_str, exit_code):
             print_lw_message("警告: 无法上报任务结束事件", color="33")
+
+    # 离线模式下发送邮件通知
+    if offline_mode and email_config and email_config.get("enabled", False):
+        send_task_notification_email(
+            email_config=email_config,
+            task_name=task_name,
+            machine=machine,
+            command=command_str,
+            exit_code=exit_code,
+            elapsed_seconds=int(elapsed),
+            log_file=log_file,
+        )
 
     # 打印结束信息
     minutes, seconds = divmod(int(elapsed), 60)
