@@ -1,0 +1,58 @@
+[project]
+name = "logwatch-client"
+version = "0.1.0"
+description = "LogWatch 客户端 - 包裹命令并上传日志到监控服务器"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "becomingw", email = "becomingw@qq.com" }
+]
+requires-python = ">=3.8"
+keywords = ["logging", "monitoring", "cli", "devops"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Logging",
+    "Topic :: System :: Monitoring",
+]
+# 无外部依赖，仅使用 Python 标准库
+dependencies = []
+
+[project.scripts]
+# 命令行入口点：安装后可使用 `lw` 或 `logwatch` 命令
+lw = "logwatch_client:main"
+logwatch = "logwatch_client:main"
+
+[project.urls]
+Homepage = "https://github.com/becomingw/logwatch"
+Repository = "https://github.com/becomingw/logwatch"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# 单文件模块：直接包含 logwatch_client.py
+packages = ["logwatch_client.py"]
+
+[tool.uv]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1.0",
+]
+
+
