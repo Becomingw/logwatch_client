@@ -1,6 +1,6 @@
 [project]
 name = "logwatch-client"
-version = "0.1.0"
+version = "0.1.2"
 description = "LogWatch 客户端 - 包裹命令并上传日志到监控服务器"
 readme = "README.md"
 license = "MIT"
