@@ -199,7 +199,7 @@ def build_task_email(
 
     if tail_logs:
         log_lines = tail_logs.strip().split('\n')[-15:]
-        plain_body += f"\n\n--- 日志尾部 ---\n" + '\n'.join(log_lines)
+        plain_body += "\n\n--- 日志尾部 ---\n" + '\n'.join(log_lines)
 
     plain_body += f"\n{'=' * 40}\n此邮件由 LogWatch 客户端离线模式发送"
 
