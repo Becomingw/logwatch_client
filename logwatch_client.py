@@ -196,13 +196,21 @@ def build_task_email(
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 状态配置（使用简洁文本图标，避免 emoji 在不同邮箱客户端显示异常）
+    # 状态配置（使用 SVG 图标替代徽章，避免显示问题）
     status_map = {
-        "start": ("开始执行", "RUN", "#2563eb", "#dbeafe"),
-        "success": ("执行成功", "OK", "#16a34a", "#dcfce7"),
-        "failed": ("执行失败", "ERR", "#dc2626", "#fee2e2"),
+        "start": ("开始执行", "#3b82f6"),   # 蓝色
+        "success": ("执行成功", "#10b981"), # 绿色
+        "failed": ("执行失败", "#ef4444"),  # 红色
     }
-    status_text, status_icon, status_color, status_bg = status_map.get(status, status_map["success"])
+    status_text, status_color = status_map.get(status, status_map["success"])
+    
+    # SVG 图标定义
+    svg_icons = {
+        "start": '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>',
+        "success": '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>',
+        "failed": '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>',
+    }
+    status_svg = svg_icons.get(status, svg_icons["success"])
 
     subject = f"[LogWatch] {task_name} - {status_text}"
 
@@ -254,7 +262,7 @@ def build_task_email(
             <tr>
                 <td style="padding: 0 16px 16px 16px;">
                     <div style="color: #6b7280; font-size: 12px; margin: 0 0 8px 0;">日志尾部</div>
-                    <pre style="margin: 0; background: #111827; color: #e5e7eb; padding: 12px; border-radius: 8px; font-size: 11px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;">{escaped_logs}</pre>
+                    <pre style="margin: 0; background: #0f172a; color: #f1f5f9; padding: 12px; border-radius: 8px; font-size: 12px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;">{escaped_logs}</pre>
                 </td>
             </tr>"""
 
@@ -279,10 +287,9 @@ def build_task_email(
           <tr>
             <td class="lw-padding" style="padding: 18px 16px; text-align: center; border-bottom: 1px solid #e5e7eb;">
               <div style="font-size: 18px; line-height: 1.3; color: #111827; font-weight: 700;">LogWatch</div>
-              <div style="margin-top: 10px;">
-                <span style="display: inline-block; background: {status_bg}; color: {status_color}; border: 1px solid {status_color}; border-radius: 999px; padding: 5px 12px; font-size: 12px; font-weight: 700; line-height: 1.2;">
-                  <span style="color: {status_color}; font-size: 12px;">&#9679;</span> {status_icon} · {status_text}
-                </span>
+              <div style="margin-top: 16px; text-align: center;">
+                <div style="line-height: 0; margin-bottom: 10px;">{status_svg}</div>
+                <div style="font-size: 18px; font-weight: 600; color: {status_color}; letter-spacing: -0.3px;">{status_text}</div>
               </div>
             </td>
           </tr>
