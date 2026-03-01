@@ -196,44 +196,38 @@ def build_task_email(
     """
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 状态配置（使用 SVG 图标替代徽章，避免显示问题）
+    # 状态配置
     status_map = {
-        "start": ("开始执行", "#3b82f6", "RUN"),   # 蓝色
-        "success": ("执行成功", "#10b981", "OK"),  # 绿色
-        "failed": ("执行失败", "#ef4444", "ERR"),  # 红色
+        "start": ("任务已开始", "#007aff"),   # Apple Blue
+        "success": ("执行成功", "#34c759"),  # Apple Green
+        "failed": ("执行失败", "#ff3b30"),   # Apple Red
     }
-    status_text, status_color, status_icon = status_map.get(status, status_map["success"])
+    status_text, status_color = status_map.get(status, status_map["success"])
     
-    # SVG 图标定义
-    svg_icons = {
-        "start": '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>',
-        "success": '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>',
-        "failed": '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>',
-    }
-    status_svg = svg_icons.get(status, svg_icons["success"])
-
     subject = f"[LogWatch] {task_name} - {status_text}"
 
     # 纯文本版本
-    plain_body = f"""LogWatch 任务通知
-{'=' * 40}
-
-状态: [{status_icon}] {status_text}
+    plain_body = f"""状态: {status_text}
 任务: {task_name}
 机器: {machine}
-命令: {command}"""
+触发时间: {now}
+"""
 
-    if exit_code is not None:
-        plain_body += f"\n退出码: {exit_code}"
+    duration_str = "-"
     if elapsed_seconds is not None:
-        plain_body += f"\n耗时: {_format_duration(elapsed_seconds)}"
-    plain_body += f"\n时间: {now}"
+        duration_str = _format_duration(elapsed_seconds)
+    plain_body += f"耗时: {duration_str}\n"
+
+    exit_code_str = str(exit_code) if exit_code is not None else "-"
+    plain_body += f"退出码: {exit_code_str}\n"
+
+    plain_body += f"命令: {command}\n"
 
     if tail_logs:
         log_lines = tail_logs.strip().split('\n')[-15:]
-        plain_body += "\n\n--- 日志尾部 ---\n" + '\n'.join(log_lines)
+        plain_body += "\n\n─── 最新日志 ───\n" + '\n'.join(log_lines)
 
-    plain_body += f"\n{'=' * 40}\n此邮件由 LogWatch 客户端离线模式发送"
+    plain_body += f"\n\n此邮件由 LogWatch 客户端离线模式发送"
 
     safe_task_name = _escape_html(task_name)
     safe_machine = _escape_html(machine)
@@ -243,87 +237,98 @@ def build_task_email(
     metrics_rows = ""
     if exit_code is not None:
         metrics_rows += f"""
-                <tr>
-                    <td style="padding: 10px 14px; border-top: 1px solid #e5e7eb; color: #6b7280; font-size: 12px;">退出码</td>
-                    <td style="padding: 10px 14px; border-top: 1px solid #e5e7eb; color: #111827; font-size: 13px; font-weight: 600; text-align: right;">{exit_code}</td>
-                </tr>"""
+                                    <tr>
+                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea;">
+                                            <span style="font-size: 14px; color: #86868b; font-weight: 500;">退出码</span>
+                                        </td>
+                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea; text-align: right;">
+                                            <span style="font-size: 15px; color: #1d1d1f; font-weight: 600;">{exit_code}</span>
+                                        </td>
+                                    </tr>"""
     if elapsed_seconds is not None:
         metrics_rows += f"""
-                <tr>
-                    <td style="padding: 10px 14px; border-top: 1px solid #e5e7eb; color: #6b7280; font-size: 12px;">耗时</td>
-                    <td style="padding: 10px 14px; border-top: 1px solid #e5e7eb; color: #111827; font-size: 13px; text-align: right;">{_format_duration(elapsed_seconds)}</td>
-                </tr>"""
+                                    <tr>
+                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea;">
+                                            <span style="font-size: 14px; color: #86868b; font-weight: 500;">耗时</span>
+                                        </td>
+                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea; text-align: right;">
+                                            <span style="font-size: 15px; color: #1d1d1f;">{_format_duration(elapsed_seconds)}</span>
+                                        </td>
+                                    </tr>"""
 
     logs_html = ""
     if tail_logs:
         log_lines = tail_logs.strip().split("\n")[-15:]
         escaped_logs = _escape_html("\n".join(log_lines))
         logs_html = f"""
-            <tr>
-                <td style="padding: 0 16px 16px 16px;">
-                    <div style="color: #6b7280; font-size: 12px; margin: 0 0 8px 0;">日志尾部</div>
-                    <pre style="margin: 0; background: #0f172a; color: #f1f5f9; padding: 12px; border-radius: 8px; font-size: 12px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;">{escaped_logs}</pre>
-                </td>
-            </tr>"""
+                                <div style="margin-top: 32px;">
+                                    <h3 style="margin: 0 0 12px; font-size: 15px; color: #1d1d1f; font-weight: 600;">最新日志</h3>
+                                    <div style="padding: 16px; background-color: #f5f5f7; border-radius: 8px; overflow-x: auto;">
+                                        <pre style="margin: 0; font-family: -apple-system, BlinkMacSystemFont, monospace; font-size: 12px; color: #1d1d1f; white-space: pre-wrap; word-break: break-all; line-height: 1.5;">{escaped_logs}</pre>
+                                    </div>
+                                </div>"""
 
     html_body = f'''<!DOCTYPE html>
-<html>
+<html lang="zh-CN">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="x-apple-disable-message-reformatting">
-  <style>
-    @media only screen and (max-width: 600px) {{
-      .lw-wrap {{ width: 100% !important; border-radius: 0 !important; }}
-      .lw-padding {{ padding-left: 12px !important; padding-right: 12px !important; }}
-    }}
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{subject}}</title>
 </head>
-<body style="margin: 0; padding: 0; background: #f3f4f6; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
-  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background: #f3f4f6;">
-    <tr>
-      <td align="center" style="padding: 16px 8px;">
-        <table role="presentation" class="lw-wrap" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width: 620px; background: #ffffff; border-radius: 12px; overflow: hidden; border: 1px solid #e5e7eb;">
-          <tr>
-            <td class="lw-padding" style="padding: 18px 16px; text-align: center; border-bottom: 1px solid #e5e7eb;">
-              <div style="font-size: 18px; line-height: 1.3; color: #111827; font-weight: 700;">LogWatch</div>
-              <div style="margin-top: 16px; text-align: center;">
-                <div style="line-height: 0; margin-bottom: 10px;">{status_svg}</div>
-                <div style="font-size: 18px; font-weight: 600; color: {status_color}; letter-spacing: -0.3px;">
-                  <span style="font-size: 14px; vertical-align: middle;">&#9679;</span> {status_text}
-                </div>
-              </div>
+<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f5f5f7; color: #1d1d1f; -webkit-font-smoothing: antialiased;">
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width: 100%; height: 100%; background-color: #f5f5f7;">
+        <tr>
+            <td align="center" style="padding: 40px 20px;">
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width: 100%; max-width: 600px; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.04);">
+                    <tr>
+                        <td style="padding: 40px 40px 20px; text-align: center;">
+                            <h1 style="margin: 0; font-size: 28px; font-weight: 600; color: #1d1d1f; letter-spacing: -0.5px;">LogWatch</h1>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 0 40px 40px;">
+                            <div>
+                                <h2 style="margin: 0 0 8px; font-size: 24px; font-weight: 600; color: {status_color}; text-align: center;">{status_text}</h2>
+                                <p style="margin: 0 0 32px; font-size: 17px; color: #1d1d1f; text-align: center;">{safe_task_name}</p>
+                                
+                                <table role="presentation" cellpadding="0" cellspacing="0" style="width: 100%; border-collapse: collapse;">
+                                    <tr>
+                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea; width: 80px;">
+                                            <span style="font-size: 14px; color: #86868b; font-weight: 500;">机器</span>
+                                        </td>
+                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea; text-align: right;">
+                                            <span style="font-size: 15px; color: #1d1d1f;">{safe_machine}</span>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea;">
+                                            <span style="font-size: 14px; color: #86868b; font-weight: 500;">触发时间</span>
+                                        </td>
+                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea; text-align: right;">
+                                            <span style="font-size: 15px; color: #1d1d1f;">{now}</span>
+                                        </td>
+                                    </tr>
+{metrics_rows}
+                                    <tr>
+                                        <td style="padding: 16px 0 0;" colspan="2">
+                                            <span style="font-size: 14px; color: #86868b; font-weight: 500; display: block; margin-bottom: 8px;">执行命令</span>
+                                            <div style="font-size: 13px; color: #1d1d1f; font-family: -apple-system, BlinkMacSystemFont, monospace; background-color: #f5f5f7; padding: 12px; border-radius: 6px; word-break: break-all;">{safe_command}</div>
+                                        </td>
+                                    </tr>
+                                </table>
+{logs_html}
+                            </div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding: 20px 40px 30px; background-color: #fafafa; text-align: center; border-top: 1px solid #f0f0f0;">
+                            <p style="margin: 0; font-size: 12px; color: #86868b; line-height: 1.5;">由 LogWatch 客户端离线模式发送</p>
+                        </td>
+                    </tr>
+                </table>
             </td>
-          </tr>
-          <tr>
-            <td class="lw-padding" style="padding: 16px;">
-              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="border: 1px solid #e5e7eb; border-radius: 8px;">
-                <tr>
-                  <td style="padding: 12px 14px; border-bottom: 1px solid #e5e7eb;">
-                    <div style="font-size: 15px; line-height: 1.4; color: #111827; font-weight: 600; word-break: break-word;">{safe_task_name}</div>
-                    <div style="margin-top: 4px; font-size: 12px; line-height: 1.4; color: #6b7280; word-break: break-word;">{safe_machine}</div>
-                  </td>
-                </tr>
-                <tr>
-                  <td style="padding: 10px 14px; border-top: 1px solid #e5e7eb; background: #f9fafb;">
-                    <div style="font-size: 11px; line-height: 1.4; color: #6b7280; margin-bottom: 4px;">命令</div>
-                    <div style="font-family: Menlo, Monaco, Consolas, 'Courier New', monospace; font-size: 12px; line-height: 1.5; color: #111827; word-break: break-word; overflow-wrap: anywhere;">{safe_command}</div>
-                  </td>
-                </tr>
-                {metrics_rows}
-              </table>
-            </td>
-          </tr>
-          {logs_html}
-          <tr>
-            <td style="padding: 12px 16px; text-align: center; background: #f9fafb; border-top: 1px solid #e5e7eb; color: #6b7280; font-size: 11px; line-height: 1.4;">
-              LogWatch 客户端离线模式 · {now}
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-  </table>
+        </tr>
+    </table>
 </body>
 </html>'''
 
