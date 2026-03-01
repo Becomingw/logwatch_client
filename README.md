@@ -164,7 +164,18 @@ email_to=notify@example.com          # 收件人
 | `--no-check` | - | 跳过服务器连通性检查 |
 | `--offline` | - | 强制离线模式 |
 
+<<<<<<< HEAD
+- **长连接传输**：基于 `requests.Session` 复用 HTTP keep-alive 连接
+- **高可靠批量上传**：默认每 100 条或 5 秒触发批量上传
+- **本地持久化队列**：SQLite WAL 队列保障断网不丢日志
+- **批量 ACK + 断点续传**：支持 `client_seq` 幂等重试与续传
+- **心跳监测**：自动发送心跳，服务端可检测任务存活状态
+- **失败重试**：网络波动时指数退避重试，支持降级离线
+- **离线模式**：服务器不可达时可选择离线模式，仅记录本地日志
+- **跨平台**：支持 Linux 和 macOS
+=======
 <div align="center">
+>>>>>>> 9165ce0 (feat: Update client code, documentation, project configuration, and publishing workflow.)
 
 <br/>
 

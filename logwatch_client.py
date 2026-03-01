@@ -23,6 +23,7 @@ import json
 import os
 import pty
 import select
+import sqlite3
 import shutil
 import signal
 import smtplib
@@ -35,10 +36,8 @@ from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
-from urllib.request import Request, urlopen
-from urllib.error import URLError
-from collections import deque
 from typing import Optional
+import requests
 
 
 # ── 配置 ──────────────────────────────────────────────
@@ -49,13 +48,19 @@ LOG_DIR = Path.home() / ".lw_logs"
 UPLOAD_INTERVAL = 2  # 秒（实时上传）
 LOG_RETENTION_DAYS = 7  # 本地日志保留天数
 LOG_MAX_FILES = 1000  # 本地日志最大文件数
-GZIP_MIN_BYTES = 64 * 1024  # 超过该大小才 gzip 压缩
-UPLOAD_RETRY_TIMES = 3  # 上传失败重试次数
-UPLOAD_RETRY_INTERVAL = 2  # 上传失败重试间隔（秒）
-UPLOAD_CIRCUIT_BREAK_MINUTES = 5  # 熔断时长（分钟）
-UPLOAD_CIRCUIT_BREAK_MAX = 3  # 熔断次数达到该值后进入离线模式
+BATCH_SIZE = 100
+BATCH_INTERVAL_MS = 5000
+COMPRESSION_LEVEL = 6
+UPLOAD_CIRCUIT_BREAK_MAX = 3  # 连续失败达到该值后进入离线模式
+UPLOAD_TIMEOUT_SECONDS = 5
+RETRY_BACKOFF_BASE_SECONDS = 1
+RETRY_BACKOFF_MAX_SECONDS = 60
 PUBLISH_GRACE_SECONDS = 1  # 发布前等待窗口（秒）
-MAX_RETRY_QUEUE = 100  # 最大重试队列大小
+QUEUE_DB_PATH = LOG_DIR / "queue.db"
+
+POST_OK = "ok"
+POST_RETRYABLE_FAIL = "retryable_fail"
+POST_TASK_DELETED = "task_deleted"
 
 
 # ── 邮件配置 ──────────────────────────────────────────
@@ -345,8 +350,17 @@ server=http://your-server.com:8000
 # user_id=alice
 
 # 日志上传间隔（秒，可选，默认 2 秒）
-# 值越小越实时，但会增加网络请求频率
+# 控制读取本地日志文件的频率
 # upload_interval_seconds=2
+
+# 批量上传每批条数（可选，默认 100）
+# batch_size=100
+
+# 批量上传最大等待时间（毫秒，可选，默认 5000）
+# batch_interval_ms=5000
+
+# gzip 压缩等级（1-9，可选，默认 6）
+# compression_level=6
 
 # 发布前等待窗口（秒，可选，默认 1 秒）
 # 等待程序稳定后再开始上传，避免瞬间退出的程序产生无效日志
@@ -358,19 +372,7 @@ server=http://your-server.com:8000
 # 本地日志最大文件数（可选，超过则删除最旧的）
 # log_max_files=1000
 
-# 日志上传超过该大小才 gzip 压缩（单位 KB）
-# upload_gzip_min_kb=64
-
-# 上传失败重试次数（可选）
-# upload_retry_times=3
-
-# 上传失败重试间隔（秒，可选）
-# upload_retry_interval_seconds=2
-
-# 熔断时长（分钟，可选）
-# upload_circuit_break_minutes=5
-
-# 熔断次数达到该值后进入离线模式（可选）
+# 连续失败达到该值后进入离线模式（可选）
 # upload_circuit_break_max=3
 
 # ── 离线邮件通知配置（可选）──────────────────────────
@@ -419,38 +421,320 @@ server=http://your-server.com:8000
 
 # ── HTTP 工具 ──────────────────────────────────────────
 
-def post_json(url: str, data: dict, timeout: float = 5, gzip_min_bytes: int = 0) -> bool:
-    """POST JSON 到服务端，失败时静默返回 False"""
+def _normalized_compression_level(level: int) -> int:
+    if level < 1:
+        return 1
+    if level > 9:
+        return 9
+    return level
+
+
+def post_json_status_with_response(
+    url: str,
+    data: dict,
+    timeout: float = UPLOAD_TIMEOUT_SECONDS,
+    gzip_min_bytes: int = 0,
+    compression_level: int = COMPRESSION_LEVEL,
+    session: Optional[requests.Session] = None,
+    request_lock: Optional[threading.Lock] = None,
+) -> tuple[str, Optional[dict], int]:
+    """POST JSON 到服务端，返回请求状态、JSON 响应和 HTTP 状态码。"""
+    own_session = session is None
+    http = session or requests.Session()
     try:
         body = json.dumps(data).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if gzip_min_bytes > 0 and len(body) >= gzip_min_bytes:
-            body = gzip.compress(body)
+            body = gzip.compress(body, compresslevel=_normalized_compression_level(compression_level))
             headers["Content-Encoding"] = "gzip"
-        req = Request(url, data=body, headers=headers)
-        urlopen(req, timeout=timeout)
-        return True
-    except (URLError, OSError, TimeoutError):
-        return False
+
+        if request_lock:
+            with request_lock:
+                resp = http.post(url, data=body, headers=headers, timeout=timeout)
+        else:
+            resp = http.post(url, data=body, headers=headers, timeout=timeout)
+        if resp.status_code == 409:
+            return POST_TASK_DELETED, None, resp.status_code
+        if 200 <= resp.status_code < 300:
+            try:
+                return POST_OK, resp.json(), resp.status_code
+            except ValueError:
+                return POST_OK, None, resp.status_code
+        return POST_RETRYABLE_FAIL, None, resp.status_code
+    except requests.RequestException:
+        return POST_RETRYABLE_FAIL, None, 0
+    finally:
+        if own_session:
+            http.close()
+
+
+def post_json_status(
+    url: str,
+    data: dict,
+    timeout: float = UPLOAD_TIMEOUT_SECONDS,
+    gzip_min_bytes: int = 0,
+    compression_level: int = COMPRESSION_LEVEL,
+    session: Optional[requests.Session] = None,
+    request_lock: Optional[threading.Lock] = None,
+) -> str:
+    status, _payload, _code = post_json_status_with_response(
+        url=url,
+        data=data,
+        timeout=timeout,
+        gzip_min_bytes=gzip_min_bytes,
+        compression_level=compression_level,
+        session=session,
+        request_lock=request_lock,
+    )
+    return status
+
+
+def post_json(
+    url: str,
+    data: dict,
+    timeout: float = UPLOAD_TIMEOUT_SECONDS,
+    gzip_min_bytes: int = 0,
+    compression_level: int = COMPRESSION_LEVEL,
+    session: Optional[requests.Session] = None,
+    request_lock: Optional[threading.Lock] = None,
+) -> bool:
+    """POST JSON 到服务端，失败时静默返回 False"""
+    return post_json_status(
+        url=url,
+        data=data,
+        timeout=timeout,
+        gzip_min_bytes=gzip_min_bytes,
+        compression_level=compression_level,
+        session=session,
+        request_lock=request_lock,
+    ) == POST_OK
+
+
+def get_json_status(
+    url: str,
+    params: Optional[dict] = None,
+    timeout: float = UPLOAD_TIMEOUT_SECONDS,
+    session: Optional[requests.Session] = None,
+    request_lock: Optional[threading.Lock] = None,
+) -> tuple[str, Optional[dict], int]:
+    own_session = session is None
+    http = session or requests.Session()
+    try:
+        if request_lock:
+            with request_lock:
+                resp = http.get(url, params=params, timeout=timeout)
+        else:
+            resp = http.get(url, params=params, timeout=timeout)
+        if resp.status_code == 409:
+            return POST_TASK_DELETED, None, resp.status_code
+        if 200 <= resp.status_code < 300:
+            try:
+                return POST_OK, resp.json(), resp.status_code
+            except ValueError:
+                return POST_OK, None, resp.status_code
+        return POST_RETRYABLE_FAIL, None, resp.status_code
+    except requests.RequestException:
+        return POST_RETRYABLE_FAIL, None, 0
+    finally:
+        if own_session:
+            http.close()
 
 
 def check_server_connectivity(server: str) -> bool:
     """检查服务端是否可达（使用心跳接口，无需鉴权）"""
-    try:
-        url = f"{server.rstrip('/')}/api/heartbeat"
-        # 发送一个空的心跳请求来测试连通性
-        body = json.dumps({"task_id": "health-check", "timestamp": datetime.now(timezone.utc).isoformat()}).encode("utf-8")
-        req = Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
-        urlopen(req, timeout=3)
-        return True
-    except (URLError, OSError, TimeoutError):
-        return False
+    status = post_json_status(
+        f"{server.rstrip('/')}/api/heartbeat",
+        {"task_id": "health-check", "timestamp": datetime.now(timezone.utc).isoformat()},
+        timeout=3,
+    )
+    return status in (POST_OK, POST_TASK_DELETED)
+
+
+# ── 本地持久化队列 ────────────────────────────────────
+
+class LogQueueStore:
+    """SQLite WAL 本地队列。"""
+
+    def __init__(self, db_path: Path):
+        self._db_path = db_path
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self._db_path), timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        return conn
+
+    def _init_db(self):
+        conn = self._connect()
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS log_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                user_id TEXT NOT NULL DEFAULT '',
+                client_seq INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(task_id, client_seq)
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_log_queue_task_status_seq ON log_queue(task_id, status, client_seq)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_log_queue_task_seq ON log_queue(task_id, client_seq)"
+        )
+        conn.commit()
+        conn.close()
+
+    def get_next_seq(self, task_id: str, min_value: int = 1) -> int:
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT COALESCE(MAX(client_seq), 0) AS max_seq FROM log_queue WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        conn.close()
+        next_seq = int(row["max_seq"]) + 1 if row else 1
+        return max(next_seq, min_value)
+
+    def enqueue(
+        self,
+        task_id: str,
+        user_id: str,
+        client_seq: int,
+        content: str,
+        timestamp: str,
+        status: str = "pending",
+    ):
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._connect()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO log_queue
+            (task_id, user_id, client_seq, content, timestamp, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (task_id, user_id, client_seq, content, timestamp, status, now, now),
+        )
+        conn.commit()
+        conn.close()
+
+    def reconcile_with_server_ack(self, task_id: str, last_ack_seq: int):
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._connect()
+        conn.execute(
+            "UPDATE log_queue SET status='sent', updated_at=? WHERE task_id=? AND client_seq<=?",
+            (now, task_id, last_ack_seq),
+        )
+        conn.execute(
+            "UPDATE log_queue SET status='pending', updated_at=? WHERE task_id=? AND client_seq>? AND status='sent'",
+            (now, task_id, last_ack_seq),
+        )
+        conn.commit()
+        conn.close()
+
+    def get_pending_count(self, task_id: str) -> int:
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM log_queue WHERE task_id=? AND status='pending'",
+            (task_id,),
+        ).fetchone()
+        conn.close()
+        return int(row["cnt"]) if row else 0
+
+    def get_pending_batch(self, task_id: str, limit: int) -> list[dict]:
+        conn = self._connect()
+        rows = conn.execute(
+            """
+            SELECT client_seq, content, timestamp
+            FROM log_queue
+            WHERE task_id=? AND status='pending'
+            ORDER BY client_seq
+            LIMIT ?
+            """,
+            (task_id, max(1, limit)),
+        ).fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def get_unsent_count(self, task_id: str) -> int:
+        conn = self._connect()
+        row = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM log_queue WHERE task_id=? AND status IN ('pending', 'failed')",
+            (task_id,),
+        ).fetchone()
+        conn.close()
+        return int(row["cnt"]) if row else 0
+
+    def reset_failed_to_pending(self, task_id: str):
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._connect()
+        conn.execute(
+            "UPDATE log_queue SET status='pending', updated_at=? WHERE task_id=? AND status='failed'",
+            (now, task_id),
+        )
+        conn.commit()
+        conn.close()
+
+    def mark_sent_up_to(self, task_id: str, ack_seq: int):
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._connect()
+        conn.execute(
+            """
+            UPDATE log_queue
+            SET status='sent', last_error=NULL, updated_at=?
+            WHERE task_id=? AND client_seq<=? AND status IN ('pending', 'failed', 'sent')
+            """,
+            (now, task_id, ack_seq),
+        )
+        conn.commit()
+        conn.close()
+
+    def mark_failed(self, task_id: str, client_seqs: list[int], error: str):
+        if not client_seqs:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._connect()
+        conn.executemany(
+            """
+            UPDATE log_queue
+            SET status='failed', retry_count=retry_count+1, last_error=?, updated_at=?
+            WHERE task_id=? AND client_seq=? AND status='pending'
+            """,
+            [(error, now, task_id, seq) for seq in client_seqs],
+        )
+        conn.commit()
+        conn.close()
+
+    def archive_task(self, task_id: str, reason: str):
+        now = datetime.now(timezone.utc).isoformat()
+        conn = self._connect()
+        conn.execute(
+            """
+            UPDATE log_queue
+            SET status='archived', last_error=?, updated_at=?
+            WHERE task_id=? AND status IN ('pending', 'failed', 'sent')
+            """,
+            (reason, now, task_id),
+        )
+        conn.commit()
+        conn.close()
 
 
 # ── 日志上传线程 ──────────────────────────────────────
 
 class LogUploader:
-    """后台线程：定时将日志增量上传到服务端，支持失败重试"""
+    """后台线程：本地 WAL 队列 + 批量压缩上传 + 批量 ACK。"""
 
     def __init__(self, server: str, task_id: str, log_file: Path, user_id: str, config: dict):
         self.server = server.rstrip("/")
@@ -461,168 +745,250 @@ class LogUploader:
         self._stop = threading.Event()
         self._thread = None
         self._heartbeat_thread = None
-        self._retry_queue = deque(maxlen=MAX_RETRY_QUEUE)
-        self._lock = threading.Lock()
-        self._circuit_until = 0.0
-        self._circuit_count = 0
+        self._request_lock = threading.Lock()
+        self._session: Optional[requests.Session] = None
+        self._queue = LogQueueStore(QUEUE_DB_PATH)
         self._offline = threading.Event()
-        self._upload_interval = _get_int_config(config, "upload_interval_seconds", UPLOAD_INTERVAL)
-        self._heartbeat_interval = 30  # 心跳间隔 30 秒
-        self._gzip_min_bytes = _get_int_config(config, "upload_gzip_min_kb", GZIP_MIN_BYTES // 1024) * 1024
-        self._retry_times = _get_int_config(config, "upload_retry_times", UPLOAD_RETRY_TIMES)
-        self._retry_interval = _get_int_config(config, "upload_retry_interval_seconds", UPLOAD_RETRY_INTERVAL)
-        self._circuit_break_seconds = _get_int_config(
-            config, "upload_circuit_break_minutes", UPLOAD_CIRCUIT_BREAK_MINUTES
-        ) * 60
-        self._circuit_max = _get_int_config(config, "upload_circuit_break_max", UPLOAD_CIRCUIT_BREAK_MAX)
+        self._task_deleted = threading.Event()
+        self._upload_interval = max(1, _get_int_config(config, "upload_interval_seconds", UPLOAD_INTERVAL))
+        self._heartbeat_interval = 30
+        self._batch_size = max(1, _get_int_config(config, "batch_size", BATCH_SIZE))
+        self._batch_interval_ms = max(100, _get_int_config(config, "batch_interval_ms", BATCH_INTERVAL_MS))
+        self._compression_level = _normalized_compression_level(
+            _get_int_config(config, "compression_level", COMPRESSION_LEVEL)
+        )
+        self._circuit_max = max(1, _get_int_config(config, "upload_circuit_break_max", UPLOAD_CIRCUIT_BREAK_MAX))
+        self._circuit_count = 0
         self._last_heartbeat = 0.0
+        self._pending_since = 0.0
+        self._next_retry_at = 0.0
+        self._retry_backoff_seconds = RETRY_BACKOFF_BASE_SECONDS
+        self._last_ack_seq = 0
+        self._next_seq = 1
+
+    def get_http_session(self) -> Optional[requests.Session]:
+        return self._session
+
+    def get_request_lock(self) -> threading.Lock:
+        return self._request_lock
 
     def start(self):
-        """启动上传线程和心跳线程"""
+        """启动上传线程和心跳线程。"""
+        if self._session is None:
+            self._session = requests.Session()
+        self._resume_from_server_ack()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         self._heartbeat_thread = threading.Thread(target=self._run_heartbeat, daemon=True)
         self._heartbeat_thread.start()
 
     def stop(self):
-        """停止上传线程和心跳线程，并做最后一次上传"""
+        """停止上传线程和心跳线程，并尽量完成最后一次批量上传。"""
         self._stop.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
         if self._heartbeat_thread and self._heartbeat_thread.is_alive():
             self._heartbeat_thread.join(timeout=5)
-        # 最后上传一次，确保不丢日志
-        self._upload()
-        # 处理重试队列中剩余的内容
-        self._flush_retry_queue()
+        self._collect_new_logs()
+        for _ in range(20):
+            if self._offline.is_set() or self._task_deleted.is_set():
+                break
+            self._queue.reset_failed_to_pending(self.task_id)
+            if self._queue.get_unsent_count(self.task_id) <= 0:
+                break
+            self._flush_batch(force=True)
+        # 退出前把 failed 统一重置回 pending，便于下次继续上传
+        self._queue.reset_failed_to_pending(self.task_id)
+        if self._session:
+            self._session.close()
+            self._session = None
 
     def _run(self):
-        while not self._stop.wait(self._upload_interval):
-            self._upload()
-            self._flush_retry_queue()
+        loop_interval = max(0.2, min(float(self._upload_interval), 1.0))
+        while not self._stop.is_set():
+            self._collect_new_logs()
+            if not self._offline.is_set() and not self._task_deleted.is_set():
+                if time.time() >= self._next_retry_at:
+                    self._queue.reset_failed_to_pending(self.task_id)
+                    self._flush_batch(force=False)
+            self._stop.wait(loop_interval)
 
     def _run_heartbeat(self):
-        """心跳线程：定期发送心跳"""
         while not self._stop.wait(self._heartbeat_interval):
             self._send_heartbeat()
 
+    def _resume_from_server_ack(self):
+        """启动时查询服务端 ACK，确保断点续传从 last_ack_seq + 1 开始。"""
+        if self._offline.is_set() or self._task_deleted.is_set():
+            return
+        if not self._session:
+            return
+
+        status, payload, code = get_json_status(
+            f"{self.server}/api/log/last-ack",
+            params={"task_id": self.task_id, "user_id": self.user_id},
+            timeout=UPLOAD_TIMEOUT_SECONDS,
+            session=self._session,
+            request_lock=self._request_lock,
+        )
+        if status == POST_TASK_DELETED:
+            self._abandon_task_push("续传 ACK 查询")
+            return
+        if status == POST_OK:
+            try:
+                self._last_ack_seq = int((payload or {}).get("last_ack_seq", 0) or 0)
+            except (TypeError, ValueError):
+                self._last_ack_seq = 0
+        elif code != 404:
+            # 网络失败或其他异常状态：保持本地序列继续，不阻塞任务执行
+            pass
+
+        self._queue.reconcile_with_server_ack(self.task_id, self._last_ack_seq)
+        self._next_seq = self._queue.get_next_seq(self.task_id, min_value=self._last_ack_seq + 1)
+
     def _send_heartbeat(self):
-        """发送心跳到服务端"""
         if self._offline.is_set():
             return
-        try:
-            success = post_json(
-                f"{self.server}/api/heartbeat",
-                {
-                    "task_id": self.task_id,
-                    "user_id": self.user_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-            )
-            if success:
-                self._last_heartbeat = time.time()
-        except Exception:
-            pass  # 心跳失败不阻塞
+        status = post_json_status(
+            f"{self.server}/api/heartbeat",
+            {
+                "task_id": self.task_id,
+                "user_id": self.user_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+            timeout=UPLOAD_TIMEOUT_SECONDS,
+            session=self._session,
+            request_lock=self._request_lock,
+        )
+        if status == POST_OK:
+            self._last_heartbeat = time.time()
+        elif status == POST_TASK_DELETED:
+            self._abandon_task_push("心跳")
 
     def _enter_offline(self):
+        if self._task_deleted.is_set():
+            return
         if not self._offline.is_set():
             self._offline.set()
-            print_lw_message("上传多次熔断，进入离线模式", color="33")
+            print_lw_message("上传连续失败，进入离线模式（日志保留在本地 WAL 队列）", color="33")
+
+    def _abandon_task_push(self, source: str):
+        if self._task_deleted.is_set():
+            return
+        self._task_deleted.set()
+        self._offline.set()
+        self._queue.archive_task(self.task_id, reason=f"task deleted: {source}")
+        print_lw_message(
+            f"任务已被服务端删除（{source}收到 HTTP 409），后续日志转归档状态",
+            color="33",
+        )
+
+    def mark_task_deleted(self, source: str):
+        self._abandon_task_push(source)
+
+    def is_task_deleted(self) -> bool:
+        return self._task_deleted.is_set()
 
     def is_offline(self) -> bool:
         return self._offline.is_set()
 
-    def _post_with_retry(self, payload: dict) -> bool:
-        if self._offline.is_set():
-            return False
-        if time.time() < self._circuit_until:
-            return False
-        retries = max(0, self._retry_times)
-        for i in range(retries + 1):
-            if post_json(
-                f"{self.server}/api/log",
-                payload,
-                gzip_min_bytes=self._gzip_min_bytes,
-            ):
-                self._circuit_count = 0
-                self._circuit_until = 0.0
-                return True
-            if i < retries:
-                time.sleep(self._retry_interval)
-        self._circuit_count += 1
-        if self._circuit_max > 0 and self._circuit_count >= self._circuit_max:
-            self._enter_offline()
-        else:
-            self._circuit_until = time.time() + self._circuit_break_seconds
-        return False
-
-    def _upload(self):
+    def _collect_new_logs(self):
         try:
-            if self._offline.is_set():
-                return
-            if time.time() < self._circuit_until:
-                return
             with open(self.log_file, "rb") as f:
                 f.seek(self._offset)
                 chunk = f.read()
             if not chunk:
                 return
-
-            # 尝试解码为文本
-            try:
-                content = chunk.decode("utf-8", errors="replace")
-            except Exception:
-                content = chunk.decode("latin-1")
-
-            new_offset = self._offset + len(chunk)
-
-            success = self._post_with_retry({
-                "task_id": self.task_id,
-                "user_id": self.user_id,
-                "content": content,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-
-            if success:
-                self._offset = new_offset
-            else:
-                # 上传失败，加入重试队列
-                with self._lock:
-                    self._retry_queue.append({
-                        "content": content,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
-                self._offset = new_offset  # 继续读取新内容，旧内容在队列中重试
-
         except FileNotFoundError:
-            pass
+            return
         except Exception:
-            pass  # 静默处理其他异常
-
-    def _flush_retry_queue(self):
-        """尝试重发队列中的失败日志"""
-        if self._offline.is_set():
             return
-        if time.time() < self._circuit_until:
-            return
-        with self._lock:
-            retry_items = list(self._retry_queue)
-            self._retry_queue.clear()
 
-        for item in retry_items:
-            success = self._post_with_retry({
+        try:
+            content = chunk.decode("utf-8", errors="replace")
+        except Exception:
+            content = chunk.decode("latin-1")
+        timestamp = datetime.now(timezone.utc).isoformat()
+        row_status = "archived" if self._task_deleted.is_set() else "pending"
+        client_seq = self._next_seq
+        self._queue.enqueue(
+            task_id=self.task_id,
+            user_id=self.user_id,
+            client_seq=client_seq,
+            content=content,
+            timestamp=timestamp,
+            status=row_status,
+        )
+        self._next_seq += 1
+        self._offset += len(chunk)
+        if row_status == "pending" and self._pending_since <= 0:
+            self._pending_since = time.time()
+
+    def _flush_batch(self, force: bool = False):
+        if self._offline.is_set() or self._task_deleted.is_set():
+            return
+        now = time.time()
+        if not force and now < self._next_retry_at:
+            return
+
+        pending_count = self._queue.get_pending_count(self.task_id)
+        if pending_count <= 0:
+            self._pending_since = 0.0
+            return
+
+        if not force and pending_count < self._batch_size:
+            if self._pending_since <= 0:
+                self._pending_since = now
+            if (now - self._pending_since) * 1000 < self._batch_interval_ms:
+                return
+
+        batch = self._queue.get_pending_batch(self.task_id, self._batch_size)
+        if not batch:
+            return
+
+        status, payload, _code = post_json_status_with_response(
+            f"{self.server}/api/log/batch",
+            {
                 "task_id": self.task_id,
                 "user_id": self.user_id,
-                "content": item["content"],
-                "timestamp": item["timestamp"],
-            })
-            if not success:
-                # 仍然失败，放回队列
-                with self._lock:
-                    if len(self._retry_queue) < MAX_RETRY_QUEUE:
-                        self._retry_queue.append(item)
-                if self._offline.is_set() or time.time() < self._circuit_until:
-                    break
+                "logs": batch,
+            },
+            timeout=UPLOAD_TIMEOUT_SECONDS,
+            gzip_min_bytes=1,
+            compression_level=self._compression_level,
+            session=self._session,
+            request_lock=self._request_lock,
+        )
+        if status == POST_OK:
+            try:
+                ack_seq = int((payload or {}).get("ack_seq", batch[-1]["client_seq"]) or 0)
+            except (TypeError, ValueError):
+                ack_seq = int(batch[-1]["client_seq"])
+            self._queue.mark_sent_up_to(self.task_id, ack_seq)
+            self._last_ack_seq = max(self._last_ack_seq, ack_seq)
+            self._circuit_count = 0
+            self._next_retry_at = 0.0
+            self._retry_backoff_seconds = RETRY_BACKOFF_BASE_SECONDS
+            if self._queue.get_pending_count(self.task_id) > 0:
+                self._pending_since = time.time()
+            else:
+                self._pending_since = 0.0
+            return
+
+        if status == POST_TASK_DELETED:
+            self._abandon_task_push("批量日志上报")
+            return
+
+        self._queue.mark_failed(
+            self.task_id,
+            [int(item["client_seq"]) for item in batch],
+            "batch upload failed",
+        )
+        self._circuit_count += 1
+        self._next_retry_at = time.time() + self._retry_backoff_seconds
+        self._retry_backoff_seconds = min(self._retry_backoff_seconds * 2, RETRY_BACKOFF_MAX_SECONDS)
+        if self._circuit_count >= self._circuit_max:
+            self._enter_offline()
 
 
 # ── 事件上报 ──────────────────────────────────────────
@@ -630,7 +996,7 @@ class LogUploader:
 def send_event(server: str, task_id: str, user_id: str, event_type: str,
                name: str, machine: str, command: str,
                exit_code: Optional[int] = None, heartbeat_interval: Optional[int] = None,
-               retries: int = 3) -> bool:
+               retries: int = 3, uploader: Optional[LogUploader] = None) -> bool:
     """上报任务事件（开始/结束/失败），支持重试"""
     data = {
         "task_id": task_id,
@@ -642,18 +1008,31 @@ def send_event(server: str, task_id: str, user_id: str, event_type: str,
         "exit_code": exit_code,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    # start 事件时发送心跳间隔，让服务端知道超时阈值
     if heartbeat_interval is not None:
         data["heartbeat_interval"] = heartbeat_interval
     url = f"{server.rstrip('/')}/api/event"
+    session = uploader.get_http_session() if uploader else None
+    request_lock = uploader.get_request_lock() if uploader else None
 
     for i in range(retries):
-        if post_json(url, data):
+        status = post_json_status(
+            url,
+            data,
+            timeout=UPLOAD_TIMEOUT_SECONDS,
+            session=session,
+            request_lock=request_lock,
+        )
+        if status == POST_OK:
             return True
+        if status == POST_TASK_DELETED:
+            if uploader:
+                uploader.mark_task_deleted("事件上报")
+            else:
+                print_lw_message("任务已被服务端删除（事件上报收到 HTTP 409），停止该任务后续上报", color="33")
+            return False
         if i < retries - 1:
-            time.sleep(1)  # 重试前等待
+            time.sleep(1)
     return False
-
 
 # ── 本地日志清理 ──────────────────────────────────────
 
@@ -927,7 +1306,8 @@ def main():
                     uploader.start()
                     uploader_started = True
                 if not send_event(server, task_id, user_id, "start", task_name, machine, command_str,
-                                  heartbeat_interval=uploader._heartbeat_interval if uploader else 30):
+                                  heartbeat_interval=uploader._heartbeat_interval if uploader else 30,
+                                  uploader=uploader):
                     print_lw_message("警告: 无法上报任务开始事件", color="33")
                 published = True
 
@@ -1039,7 +1419,7 @@ def main():
         if uploader and not uploader_started:
             uploader.start()
             uploader_started = True
-        if not send_event(server, task_id, user_id, "start", task_name, machine, command_str):
+        if not send_event(server, task_id, user_id, "start", task_name, machine, command_str, uploader=uploader):
             print_lw_message("警告: 无法上报任务开始事件", color="33")
         published = True
 
@@ -1055,7 +1435,7 @@ def main():
     # 上报任务结束
     event_type = "success" if exit_code == 0 else "failed"
     if published and not offline_mode:
-        if not send_event(server, task_id, user_id, event_type, task_name, machine, command_str, exit_code):
+        if not send_event(server, task_id, user_id, event_type, task_name, machine, command_str, exit_code, uploader=uploader):
             print_lw_message("警告: 无法上报任务结束事件", color="33")
 
     # 离线模式下发送邮件通知

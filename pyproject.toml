@@ -26,8 +26,10 @@ classifiers = [
     "Topic :: System :: Logging",
     "Topic :: System :: Monitoring",
 ]
-# 无外部依赖，仅使用 Python 标准库
-dependencies = []
+# 传输层使用 requests.Session 长连接
+dependencies = [
+    "requests>=2.31.0",
+]
 
 [project.scripts]
 # 命令行入口点：安装后可使用 `lw` 或 `logwatch` 命令
@@ -54,5 +56,4 @@ dev = [
     "pytest>=7.0",
     "ruff>=0.1.0",
 ]
-
 
