@@ -198,11 +198,11 @@ def build_task_email(
 
     # 状态配置（使用 SVG 图标替代徽章，避免显示问题）
     status_map = {
-        "start": ("开始执行", "#3b82f6"),   # 蓝色
-        "success": ("执行成功", "#10b981"), # 绿色
-        "failed": ("执行失败", "#ef4444"),  # 红色
+        "start": ("开始执行", "#3b82f6", "RUN"),   # 蓝色
+        "success": ("执行成功", "#10b981", "OK"),  # 绿色
+        "failed": ("执行失败", "#ef4444", "ERR"),  # 红色
     }
-    status_text, status_color = status_map.get(status, status_map["success"])
+    status_text, status_color, status_icon = status_map.get(status, status_map["success"])
     
     # SVG 图标定义
     svg_icons = {
@@ -289,7 +289,9 @@ def build_task_email(
               <div style="font-size: 18px; line-height: 1.3; color: #111827; font-weight: 700;">LogWatch</div>
               <div style="margin-top: 16px; text-align: center;">
                 <div style="line-height: 0; margin-bottom: 10px;">{status_svg}</div>
-                <div style="font-size: 18px; font-weight: 600; color: {status_color}; letter-spacing: -0.3px;">{status_text}</div>
+                <div style="font-size: 18px; font-weight: 600; color: {status_color}; letter-spacing: -0.3px;">
+                  <span style="font-size: 14px; vertical-align: middle;">&#9679;</span> {status_text}
+                </div>
               </div>
             </td>
           </tr>
