@@ -34,7 +34,7 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -60,6 +60,8 @@ RETRY_BACKOFF_BASE_SECONDS = 5
 RETRY_BACKOFF_MAX_SECONDS = 60
 PUBLISH_GRACE_SECONDS = 1  # 发布前等待窗口（秒）
 QUEUE_DB_PATH = LOG_DIR / "queue.db"
+SHANGHAI_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
+SHANGHAI_TZ_LABEL = "Asia/Shanghai (UTC+8)"
 
 POST_OK = "ok"
 POST_RETRYABLE_FAIL = "retryable_fail"
@@ -180,6 +182,10 @@ def _escape_html(value: str) -> str:
     )
 
 
+def _now_shanghai_str() -> str:
+    return f"{datetime.now(SHANGHAI_TZ).strftime('%Y-%m-%d %H:%M:%S')} {SHANGHAI_TZ_LABEL}"
+
+
 def build_task_email(
     task_name: str,
     machine: str,
@@ -194,20 +200,20 @@ def build_task_email(
     status: start=开始执行, success=执行成功, failed=执行失败
     返回: (subject, plain_body, html_body)
     """
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = _now_shanghai_str()
 
     # 状态配置
     status_map = {
-        "start": ("任务已开始", "#007aff"),   # Apple Blue
-        "success": ("执行成功", "#34c759"),  # Apple Green
-        "failed": ("执行失败", "#ff3b30"),   # Apple Red
+        "start": ("任务已开始", "#007aff", "RUN"),   # Apple Blue
+        "success": ("执行成功", "#34c759", "OK"),    # Apple Green
+        "failed": ("执行失败", "#ff3b30", "ERR"),    # Apple Red
     }
-    status_text, status_color = status_map.get(status, status_map["success"])
+    status_text, status_color, status_icon = status_map.get(status, status_map["success"])
     
     subject = f"[LogWatch] {task_name} - {status_text}"
 
     # 纯文本版本
-    plain_body = f"""状态: {status_text}
+    plain_body = f"""状态: [{status_icon}] {status_text}
 任务: {task_name}
 机器: {machine}
 触发时间: {now}
@@ -227,7 +233,7 @@ def build_task_email(
         log_lines = tail_logs.strip().split('\n')[-15:]
         plain_body += "\n\n─── 最新日志 ───\n" + '\n'.join(log_lines)
 
-    plain_body += f"\n\n此邮件由 LogWatch 客户端离线模式发送"
+    plain_body += "\n\n此邮件由 LogWatch 客户端离线模式发送"
 
     safe_task_name = _escape_html(task_name)
     safe_machine = _escape_html(machine)
@@ -288,7 +294,7 @@ def build_task_email(
                     <tr>
                         <td style="padding: 0 40px 40px;">
                             <div>
-                                <h2 style="margin: 0 0 8px; font-size: 24px; font-weight: 600; color: {status_color}; text-align: center;">{status_text}</h2>
+                                <h2 style="margin: 0 0 8px; font-size: 24px; font-weight: 600; color: {status_color}; text-align: center;">&#9679; {status_text}</h2>
                                 <p style="margin: 0 0 32px; font-size: 17px; color: #1d1d1f; text-align: center;">{safe_task_name}</p>
                                 
                                 <table role="presentation" cellpadding="0" cellspacing="0" style="width: 100%; border-collapse: collapse;">
@@ -1589,7 +1595,7 @@ def main():
     user_token = getattr(args, "user_token", None) or get_user_token(config)
 
     task_id = str(uuid.uuid4())
-    task_name = args.name or f"{machine}-{datetime.now().strftime('%m%d-%H%M%S')}"
+    task_name = args.name or f"{machine}-{datetime.now(SHANGHAI_TZ).strftime('%m%d-%H%M%S')}"
     command_str = " ".join(command)
     command_cwd = str(Path.cwd().resolve())
     task_python_version = sys.version.split()[0]
