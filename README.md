@@ -174,8 +174,6 @@ email_to=notify@example.com          # 收件人
 - **离线模式**：服务器不可达时可选择离线模式，仅记录本地日志
 - **跨平台**：支持 Linux 和 macOS
 =======
-<div align="center">
->>>>>>> 9165ce0 (feat: Update client code, documentation, project configuration, and publishing workflow.)
 
 <br/>
 
