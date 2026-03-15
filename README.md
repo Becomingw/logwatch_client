@@ -70,6 +70,10 @@ lw --health
 lw --user-id 104698 --user-token ut_xxx python long_running_test.py
 ```
 
+> `lw` 会为每次执行自动生成新的 UUID `task_id`。这个 ID 只代表这一次运行；服务端删除后不会复用，也不会被后续推送重新激活。
+
+> 如果任务在服务端被删除，客户端会把后续日志转为本地归档，不再尝试重新激活该任务；若只是网络中断，则会进入低频离线探测并在恢复后继续上传。
+
 <br>
 
 ---
@@ -288,11 +292,25 @@ email_to=notify@example.com
 - **连通性探测**
   `GET /api/health`
 - **离线模式**
-  达到阈值后自动进入
+  达到阈值后自动进入低频探测
 
 </td>
 </tr>
 </table>
+
+<br>
+
+---
+
+<br>
+
+## 🔁 协议语义
+
+- `task_id` 表示一次运行实例，客户端不会复用，服务端也不会接受复用
+- 服务端删除任务后会保留 tombstone，旧客户端后续 `event`、`log`、`heartbeat`、`last-ack` 推送会收到 `409 task_deleted`
+- 客户端收到 `task_deleted` 后停止该任务后续上报，并将本地队列标记为 `archived`
+- 客户端收到 `task_not_running` 时不会立即放弃任务，而是按可重试异常处理
+- 网络故障与任务删除是两类不同状态：前者允许恢复，后者不允许复活原任务
 
 <br>
 

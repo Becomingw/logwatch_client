@@ -58,6 +58,7 @@ UPLOAD_CIRCUIT_BREAK_MAX = 5  # 连续重连失败达到该值后停止重连并
 UPLOAD_TIMEOUT_SECONDS = 5
 RETRY_BACKOFF_BASE_SECONDS = 5
 RETRY_BACKOFF_MAX_SECONDS = 60
+OFFLINE_PROBE_INTERVAL_SECONDS = 60
 PUBLISH_GRACE_SECONDS = 1  # 发布前等待窗口（秒）
 QUEUE_DB_PATH = LOG_DIR / "queue.db"
 SHANGHAI_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
@@ -66,6 +67,8 @@ SHANGHAI_TZ_LABEL = "Asia/Shanghai (UTC+8)"
 POST_OK = "ok"
 POST_RETRYABLE_FAIL = "retryable_fail"
 POST_TASK_DELETED = "task_deleted"
+POST_TASK_ID_CONFLICT = "task_id_conflict"
+POST_TASK_NOT_RUNNING = "task_not_running"
 
 
 class TransportState(str, Enum):
@@ -73,6 +76,14 @@ class TransportState(str, Enum):
     RETRYING = "retrying"
     OFFLINE_GIVEUP = "offline_giveup"
     TASK_DELETED = "task_deleted"
+
+
+def generate_task_id(prefix: str = "") -> str:
+    """为每次任务执行生成全局唯一且永不复用的 task_id。"""
+    task_id = str(uuid.uuid4())
+    if prefix:
+        return f"{prefix}{task_id}"
+    return task_id
 
 
 # ── 邮件配置 ──────────────────────────────────────────
@@ -660,7 +671,7 @@ def setup_config():
     if not _prompt_yes_no("是否执行进阶测试（上报 start/heartbeat/success）", connectivity_ok):
         return
 
-    setup_task_id = f"setup-{uuid.uuid4()}"
+    setup_task_id = generate_task_id("setup-")
     setup_name = "lw-setup-test"
     setup_command = "lw --setup"
     setup_cwd = str(Path.cwd().resolve())
@@ -728,6 +739,29 @@ def build_user_auth_headers(user_id: str, user_token: str) -> dict:
     return headers
 
 
+def _classify_conflict_response(resp: requests.Response) -> str:
+    detail_message = ""
+    detail_code = ""
+    try:
+        payload = resp.json()
+        detail = payload.get("detail") if isinstance(payload, dict) else payload
+        if isinstance(detail, dict):
+            detail_code = str(detail.get("code") or "").strip().lower()
+            detail_message = str(detail.get("message") or "").strip().lower()
+        else:
+            detail_message = str(detail or "").strip().lower()
+    except ValueError:
+        detail_message = (resp.text or "").strip().lower()
+
+    if detail_code == POST_TASK_DELETED or "已被删除" in detail_message or "deleted" in detail_message:
+        return POST_TASK_DELETED
+    if detail_code == POST_TASK_ID_CONFLICT or "task_id already exists" in detail_message:
+        return POST_TASK_ID_CONFLICT
+    if detail_code == POST_TASK_NOT_RUNNING or "not running" in detail_message:
+        return POST_TASK_NOT_RUNNING
+    return POST_RETRYABLE_FAIL
+
+
 def post_json_status_with_response(
     url: str,
     data: dict,
@@ -756,7 +790,7 @@ def post_json_status_with_response(
         else:
             resp = http.post(url, data=body, headers=headers, timeout=timeout)
         if resp.status_code == 409:
-            return POST_TASK_DELETED, None, resp.status_code
+            return _classify_conflict_response(resp), None, resp.status_code
         if 200 <= resp.status_code < 300:
             try:
                 return POST_OK, resp.json(), resp.status_code
@@ -833,7 +867,7 @@ def get_json_status(
         else:
             resp = http.get(url, params=params, headers=auth_headers, timeout=timeout)
         if resp.status_code == 409:
-            return POST_TASK_DELETED, None, resp.status_code
+            return _classify_conflict_response(resp), None, resp.status_code
         if 200 <= resp.status_code < 300:
             try:
                 return POST_OK, resp.json(), resp.status_code
@@ -1071,6 +1105,10 @@ class LogUploader:
         self._transport_state = TransportState.ONLINE
         self._upload_interval = max(1, _get_int_config(config, "upload_interval_seconds", UPLOAD_INTERVAL))
         self._heartbeat_interval = 30
+        self._offline_probe_interval = max(
+            self._heartbeat_interval,
+            _get_int_config(config, "offline_probe_interval_seconds", OFFLINE_PROBE_INTERVAL_SECONDS),
+        )
         self._batch_size = max(1, _get_int_config(config, "batch_size", BATCH_SIZE))
         self._batch_interval_ms = max(100, _get_int_config(config, "batch_interval_ms", BATCH_INTERVAL_MS))
         self._compression_level = _normalized_compression_level(
@@ -1129,12 +1167,15 @@ class LogUploader:
         self._circuit_count = 0
         self._next_retry_at = 0.0
         self._retry_backoff_seconds = RETRY_BACKOFF_BASE_SECONDS
-        if changed and old_state == TransportState.RETRYING:
+        if changed and old_state in (TransportState.RETRYING, TransportState.OFFLINE_GIVEUP):
             print_lw_message(f"{source}恢复，已重新连接服务端", color="32")
 
     def _mark_retryable_failure(self, source: str, count_towards_giveup: bool = True):
         state = self._get_transport_state()
-        if state in (TransportState.OFFLINE_GIVEUP, TransportState.TASK_DELETED):
+        if state == TransportState.TASK_DELETED:
+            return
+        if state == TransportState.OFFLINE_GIVEUP:
+            self._next_retry_at = time.time() + self._offline_probe_interval
             return
         old_state, changed = self._set_transport_state(TransportState.RETRYING)
         self._sync_state_events(TransportState.RETRYING)
@@ -1225,7 +1266,9 @@ class LogUploader:
         self._next_seq = self._queue.get_next_seq(self.task_id, min_value=self._last_ack_seq + 1)
 
     def _send_heartbeat(self):
-        if self._offline.is_set():
+        if self._task_deleted.is_set():
+            return
+        if self._offline.is_set() and time.time() < self._next_retry_at:
             return
         status = post_json_status(
             f"{self.server}/api/heartbeat",
@@ -1244,6 +1287,8 @@ class LogUploader:
             self._mark_transport_success("心跳")
         elif status == POST_TASK_DELETED:
             self._abandon_task_push("心跳")
+        elif status == POST_TASK_NOT_RUNNING:
+            self._mark_retryable_failure("心跳", count_towards_giveup=False)
         else:
             self._mark_retryable_failure("心跳")
 
@@ -1252,22 +1297,29 @@ class LogUploader:
         if not changed:
             return
         self._sync_state_events(TransportState.OFFLINE_GIVEUP)
+        self._next_retry_at = time.time() + self._offline_probe_interval
         if old_state != TransportState.TASK_DELETED:
-            print_lw_message("连续多次重连失败，停止重连并进入完全离线模式", color="33")
+            print_lw_message("连续多次重连失败，进入低频离线探测模式", color="33")
 
-    def _abandon_task_push(self, source: str):
+    def _reject_task_push(self, source: str, reason: str):
         _old_state, changed = self._set_transport_state(TransportState.TASK_DELETED)
         if not changed:
             return
         self._sync_state_events(TransportState.TASK_DELETED)
-        self._queue.archive_task(self.task_id, reason=f"task deleted: {source}")
+        self._queue.archive_task(self.task_id, reason=f"{reason}: {source}")
         print_lw_message(
-            f"任务已被服务端删除（{source}收到 HTTP 409），后续日志转归档状态",
+            f"任务上报已被服务端拒绝（{reason}，来源: {source}），后续日志转归档状态",
             color="33",
         )
 
+    def _abandon_task_push(self, source: str):
+        self._reject_task_push(source, "task deleted")
+
     def mark_task_deleted(self, source: str):
         self._abandon_task_push(source)
+
+    def mark_task_id_conflict(self, source: str):
+        self._reject_task_push(source, "task_id conflict")
 
     def mark_transport_success(self, source: str):
         self._mark_transport_success(source)
@@ -1386,6 +1438,31 @@ def send_event(server: str, task_id: str, user_id: str, user_token: str, event_t
                retries: int = 3, uploader: Optional[LogUploader] = None,
                cwd: str = "", pid: Optional[int] = None, python_version: str = "") -> bool:
     """上报任务事件（开始/结束/失败），支持重试"""
+    return send_event_status(
+        server=server,
+        task_id=task_id,
+        user_id=user_id,
+        user_token=user_token,
+        event_type=event_type,
+        name=name,
+        machine=machine,
+        command=command,
+        exit_code=exit_code,
+        heartbeat_interval=heartbeat_interval,
+        retries=retries,
+        uploader=uploader,
+        cwd=cwd,
+        pid=pid,
+        python_version=python_version,
+    ) == POST_OK
+
+
+def send_event_status(server: str, task_id: str, user_id: str, user_token: str, event_type: str,
+                      name: str, machine: str, command: str,
+                      exit_code: Optional[int] = None, heartbeat_interval: Optional[int] = None,
+                      retries: int = 3, uploader: Optional[LogUploader] = None,
+                      cwd: str = "", pid: Optional[int] = None, python_version: str = "") -> str:
+    """上报任务事件（开始/结束/失败），返回最终请求状态。"""
     data = {
         "task_id": task_id,
         "user_id": user_id,
@@ -1418,18 +1495,31 @@ def send_event(server: str, task_id: str, user_id: str, user_token: str, event_t
         if status == POST_OK:
             if uploader:
                 uploader.mark_transport_success("事件上报")
-            return True
+            return POST_OK
         if status == POST_TASK_DELETED:
             if uploader:
                 uploader.mark_task_deleted("事件上报")
             else:
                 print_lw_message("任务已被服务端删除（事件上报收到 HTTP 409），停止该任务后续上报", color="33")
-            return False
+            return POST_TASK_DELETED
+        if status == POST_TASK_ID_CONFLICT:
+            if uploader:
+                uploader.mark_task_id_conflict("事件上报")
+            else:
+                print_lw_message("任务 ID 与已有任务冲突，当前任务不会继续上报", color="33")
+            return POST_TASK_ID_CONFLICT
         if uploader:
             uploader.mark_retryable_failure("事件上报", count_towards_giveup=False)
         if i < retries - 1:
             time.sleep(1)
-    return False
+    return POST_RETRYABLE_FAIL
+
+
+def should_send_completion_email(offline_mode: bool, final_event_status: str) -> bool:
+    """结束事件若未成功上报，则在可重试失败场景回退到离线邮件通知。"""
+    if offline_mode:
+        return True
+    return final_event_status == POST_RETRYABLE_FAIL
 
 # ── 本地日志清理 ──────────────────────────────────────
 
@@ -1594,7 +1684,7 @@ def main():
     # user_token: 命令行 > 配置文件 > 环境变量
     user_token = getattr(args, "user_token", None) or get_user_token(config)
 
-    task_id = str(uuid.uuid4())
+    task_id = generate_task_id()
     task_name = args.name or f"{machine}-{datetime.now(SHANGHAI_TZ).strftime('%m%d-%H%M%S')}"
     command_str = " ".join(command)
     command_cwd = str(Path.cwd().resolve())
@@ -1856,15 +1946,23 @@ def main():
 
     # 上报任务结束
     event_type = "success" if exit_code == 0 else "failed"
+    final_event_status = POST_OK
     if published and not offline_mode:
-        if not send_event(
+        final_event_status = send_event_status(
             server, task_id, user_id, user_token or "", event_type, task_name, machine, command_str, exit_code,
             uploader=uploader, cwd=command_cwd, pid=task_pid, python_version=task_python_version
-        ):
+        )
+        if final_event_status != POST_OK:
             print_lw_message("警告: 无法上报任务结束事件", color="33")
 
-    # 离线模式下发送邮件通知
-    if offline_mode and email_config and email_config.get("enabled", False):
+    send_completion_email = should_send_completion_email(offline_mode, final_event_status)
+    if send_completion_email and email_config is None:
+        email_config = load_email_config(config)
+    if final_event_status == POST_RETRYABLE_FAIL and not offline_mode:
+        print_lw_message("任务结束事件未成功上报，回退为离线邮件通知", color="33")
+
+    # 离线模式或结束事件重试失败时发送邮件通知
+    if send_completion_email and email_config and email_config.get("enabled", False):
         send_task_notification_email(
             email_config=email_config,
             task_name=task_name,
