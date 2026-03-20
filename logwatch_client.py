@@ -1823,13 +1823,17 @@ def main():
             # 设置信号处理
             original_sigint = signal.getsignal(signal.SIGINT)
             original_sigterm = signal.getsignal(signal.SIGTERM)
+            original_sigwinch = signal.getsignal(signal.SIGWINCH)
 
             def handle_signal(signum, _frame):
                 if child_pid and not child_terminated:
                     try:
-                        os.kill(child_pid, signum)
+                        os.killpg(child_pid, signum)
                     except OSError:
-                        pass
+                        try:
+                            os.kill(child_pid, signum)
+                        except OSError:
+                            pass
 
             def handle_winch(_signum, _frame):
                 try:
@@ -1905,6 +1909,7 @@ def main():
                 log_fd.close()
                 signal.signal(signal.SIGINT, original_sigint)
                 signal.signal(signal.SIGTERM, original_sigterm)
+                signal.signal(signal.SIGWINCH, original_sigwinch)
 
             # 等待子进程
             if not child_terminated:
