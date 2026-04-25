@@ -1,6 +1,7 @@
 """LogWatch 客户端基础测试"""
 
 import uuid
+import stat
 from unittest.mock import Mock
 
 import logwatch_client
@@ -29,6 +30,25 @@ def test_get_int_config():
     assert logwatch_client._get_int_config(config, "invalid", 10) == 10
     
     assert logwatch_client._get_int_config(config, "nonexistent", 42) == 42
+
+
+def test_write_config_uses_owner_only_permissions(tmp_path):
+    """测试：写入 ~/.lwconfig 时限制为仅当前用户可读写"""
+    original_path = logwatch_client.CONFIG_PATH
+    try:
+        config_path = tmp_path / ".lwconfig"
+        logwatch_client.CONFIG_PATH = config_path
+        logwatch_client._write_config({
+            "server": "http://127.0.0.1:8000",
+            "user_id": "u1",
+            "user_token": "ut_secret",
+        })
+
+        mode = stat.S_IMODE(config_path.stat().st_mode)
+        assert mode == 0o600
+        assert "user_token=ut_secret" in config_path.read_text()
+    finally:
+        logwatch_client.CONFIG_PATH = original_path
 
 
 def test_precheck_command_exists():
@@ -187,6 +207,113 @@ def test_collect_new_logs_archives_rows_after_task_deleted(tmp_path):
         assert "hello after delete" in row["content"]
     finally:
         logwatch_client.QUEUE_DB_PATH = original_queue_db_path
+
+
+def test_collect_new_logs_splits_large_output_without_losing_text(tmp_path):
+    original_queue_db_path = logwatch_client.QUEUE_DB_PATH
+    try:
+        queue_db = tmp_path / "queue.db"
+        logwatch_client.QUEUE_DB_PATH = queue_db
+        log_file = tmp_path / "large.log"
+        content = ("a" * 1100) + "é" + ("b" * 1100)
+        log_file.write_bytes(content.encode("utf-8"))
+
+        uploader = logwatch_client.LogUploader(
+            server="http://127.0.0.1:8000",
+            task_id="task-large-log-test",
+            log_file=log_file,
+            user_id="u1",
+            user_token="ut_test",
+            config={"log_chunk_bytes": "1024"},
+        )
+        uploader._collect_new_logs(final=True)
+
+        queue = logwatch_client.LogQueueStore(queue_db)
+        conn = queue._connect()
+        rows = conn.execute(
+            "SELECT content FROM log_queue WHERE task_id=? ORDER BY client_seq",
+            ("task-large-log-test",),
+        ).fetchall()
+        conn.close()
+
+        assert len(rows) >= 2
+        assert "".join(row["content"] for row in rows) == content
+    finally:
+        logwatch_client.QUEUE_DB_PATH = original_queue_db_path
+
+
+def test_flush_batch_splits_payload_after_413(monkeypatch, tmp_path):
+    original_queue_db_path = logwatch_client.QUEUE_DB_PATH
+    try:
+        queue_db = tmp_path / "queue.db"
+        logwatch_client.QUEUE_DB_PATH = queue_db
+        uploader = logwatch_client.LogUploader(
+            server="http://127.0.0.1:8000",
+            task_id="task-split-413-test",
+            log_file=tmp_path / "split.log",
+            user_id="u1",
+            user_token="ut_test",
+            config={"batch_size": "2"},
+        )
+        uploader._queue.enqueue("task-split-413-test", "u1", 1, "first", "2026-03-15T10:00:00+00:00")
+        uploader._queue.enqueue("task-split-413-test", "u1", 2, "second", "2026-03-15T10:00:01+00:00")
+        sent_batches = []
+
+        def fake_post(*args, **_kwargs):
+            payload = args[1]
+            seqs = [item["client_seq"] for item in payload["logs"]]
+            sent_batches.append(seqs)
+            if len(seqs) > 1:
+                return logwatch_client.POST_RETRYABLE_FAIL, None, 413
+            return logwatch_client.POST_OK, {"ack_seq": seqs[-1]}, 200
+
+        monkeypatch.setattr(logwatch_client, "post_json_status_with_response", fake_post)
+
+        uploader._flush_batch(force=True)
+
+        conn = uploader._queue._connect()
+        statuses = [
+            row["status"]
+            for row in conn.execute(
+                "SELECT status FROM log_queue WHERE task_id=? ORDER BY client_seq",
+                ("task-split-413-test",),
+            ).fetchall()
+        ]
+        conn.close()
+
+        assert sent_batches == [[1, 2], [1], [2]]
+        assert statuses == ["sent", "sent"]
+    finally:
+        logwatch_client.QUEUE_DB_PATH = original_queue_db_path
+
+
+def test_log_queue_prunes_old_sent_rows(tmp_path):
+    queue = logwatch_client.LogQueueStore(tmp_path / "queue.db")
+    task_id = "task-prune-sent"
+    for seq in range(1, 6):
+        queue.enqueue(task_id, "u1", seq, f"line-{seq}", "2026-03-15T10:00:00+00:00")
+    queue.mark_sent_up_to(task_id, 5)
+
+    deleted = queue.prune_sent(task_id, keep_rows=2)
+
+    conn = queue._connect()
+    rows = conn.execute(
+        "SELECT client_seq, status FROM log_queue WHERE task_id=? ORDER BY client_seq",
+        (task_id,),
+    ).fetchall()
+    conn.close()
+    queue.close()
+
+    assert deleted == 3
+    assert [(row["client_seq"], row["status"]) for row in rows] == [(4, "sent"), (5, "sent")]
+
+
+def test_classify_not_found_response_by_task_not_found_message():
+    response = Mock()
+    response.json.return_value = {"detail": "task not found"}
+    response.text = ""
+
+    assert logwatch_client._classify_not_found_response(response) == logwatch_client.POST_TASK_NOT_FOUND
 
 
 def test_send_event_status_returns_retryable_fail_after_retries(monkeypatch):

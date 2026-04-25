@@ -20,6 +20,7 @@ lw - LogWatch 客户端
 from __future__ import annotations
 
 import argparse
+import codecs
 import gzip
 import json
 import os
@@ -53,6 +54,12 @@ LOG_RETENTION_DAYS = 7  # 本地日志保留天数
 LOG_MAX_FILES = 1000  # 本地日志最大文件数
 BATCH_SIZE = 100
 BATCH_INTERVAL_MS = 5000
+LOG_CHUNK_BYTES = 256 * 1024
+MAX_LOG_CHUNK_BYTES = 1024 * 1024
+BATCH_MAX_BYTES = 4 * 1024 * 1024
+MAX_BATCH_MAX_BYTES = 8 * 1024 * 1024
+QUEUE_SENT_KEEP_ROWS = 1000
+QUEUE_CHECKPOINT_MIN_DELETED_ROWS = 100
 COMPRESSION_LEVEL = 6
 UPLOAD_CIRCUIT_BREAK_MAX = 5  # 连续重连失败达到该值后停止重连并进入完全离线
 UPLOAD_TIMEOUT_SECONDS = 5
@@ -69,6 +76,7 @@ POST_RETRYABLE_FAIL = "retryable_fail"
 POST_TASK_DELETED = "task_deleted"
 POST_TASK_ID_CONFLICT = "task_id_conflict"
 POST_TASK_NOT_RUNNING = "task_not_running"
+POST_TASK_NOT_FOUND = "task_not_found"
 
 
 class TransportState(str, Enum):
@@ -197,6 +205,30 @@ def _now_shanghai_str() -> str:
     return f"{datetime.now(SHANGHAI_TZ).strftime('%Y-%m-%d %H:%M:%S')} {SHANGHAI_TZ_LABEL}"
 
 
+def _email_status_tint(status_color: str) -> str:
+    tint_map = {
+        "#16a34a": "#ecfdf3",
+        "#2563eb": "#eff6ff",
+        "#dc2626": "#fef2f2",
+        "#34c759": "#ecfdf3",
+        "#007aff": "#eff6ff",
+        "#ff3b30": "#fef2f2",
+    }
+    return tint_map.get(status_color.lower(), "#f3f4f6")
+
+
+def _email_detail_row(label: str, value_html: str) -> str:
+    return f"""
+                                    <tr>
+                                        <td class="info-label" style="padding: 13px 14px 13px 0; border-bottom: 1px solid #edf0f4; width: 36%; vertical-align: top;">
+                                            <span style="font-size: 13px; color: #6b7280; font-weight: 600;">{_escape_html(label)}</span>
+                                        </td>
+                                        <td class="info-value" style="padding: 13px 0; border-bottom: 1px solid #edf0f4; text-align: right; vertical-align: top;">
+                                            <span style="font-size: 14px; line-height: 1.45; color: #111827; font-weight: 600; word-break: break-word;">{value_html}</span>
+                                        </td>
+                                    </tr>"""
+
+
 def build_task_email(
     task_name: str,
     machine: str,
@@ -215,9 +247,9 @@ def build_task_email(
 
     # 状态配置
     status_map = {
-        "start": ("任务已开始", "#007aff", "RUN"),   # Apple Blue
-        "success": ("执行成功", "#34c759", "OK"),    # Apple Green
-        "failed": ("执行失败", "#ff3b30", "ERR"),    # Apple Red
+        "start": ("任务已开始", "#2563eb", "RUN"),
+        "success": ("执行成功", "#16a34a", "OK"),
+        "failed": ("执行失败", "#dc2626", "ERR"),
     }
     status_text, status_color, status_icon = status_map.get(status, status_map["success"])
     
@@ -250,38 +282,24 @@ def build_task_email(
     safe_machine = _escape_html(machine)
     command_preview = command[:200] + ("..." if len(command) > 200 else "")
     safe_command = _escape_html(command_preview)
+    safe_subject = _escape_html(subject)
 
-    metrics_rows = ""
+    metrics_rows = _email_detail_row("机器", safe_machine)
+    metrics_rows += _email_detail_row("触发时间", _escape_html(now))
     if exit_code is not None:
-        metrics_rows += f"""
-                                    <tr>
-                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea;">
-                                            <span style="font-size: 14px; color: #86868b; font-weight: 500;">退出码</span>
-                                        </td>
-                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea; text-align: right;">
-                                            <span style="font-size: 15px; color: #1d1d1f; font-weight: 600;">{exit_code}</span>
-                                        </td>
-                                    </tr>"""
+        metrics_rows += _email_detail_row("退出码", _escape_html(str(exit_code)))
     if elapsed_seconds is not None:
-        metrics_rows += f"""
-                                    <tr>
-                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea;">
-                                            <span style="font-size: 14px; color: #86868b; font-weight: 500;">耗时</span>
-                                        </td>
-                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea; text-align: right;">
-                                            <span style="font-size: 15px; color: #1d1d1f;">{_format_duration(elapsed_seconds)}</span>
-                                        </td>
-                                    </tr>"""
+        metrics_rows += _email_detail_row("耗时", _escape_html(_format_duration(elapsed_seconds)))
 
     logs_html = ""
     if tail_logs:
         log_lines = tail_logs.strip().split("\n")[-15:]
         escaped_logs = _escape_html("\n".join(log_lines))
         logs_html = f"""
-                                <div style="margin-top: 32px;">
-                                    <h3 style="margin: 0 0 12px; font-size: 15px; color: #1d1d1f; font-weight: 600;">最新日志</h3>
-                                    <div style="padding: 16px; background-color: #f5f5f7; border-radius: 8px; overflow-x: auto;">
-                                        <pre style="margin: 0; font-family: -apple-system, BlinkMacSystemFont, monospace; font-size: 12px; color: #1d1d1f; white-space: pre-wrap; word-break: break-all; line-height: 1.5;">{escaped_logs}</pre>
+                                <div style="margin-top: 22px;">
+                                    <h3 style="margin: 0 0 10px; font-size: 15px; color: #111827; font-weight: 750;">最新日志</h3>
+                                    <div style="background-color: #0f172a; border-radius: 8px; overflow-x: auto; -webkit-overflow-scrolling: touch;">
+                                        <pre class="log-pre" style="margin: 0; padding: 14px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace; font-size: 12px; color: #dbeafe; white-space: pre-wrap; word-break: break-word; line-height: 1.62;">{escaped_logs}</pre>
                                     </div>
                                 </div>"""
 
@@ -290,46 +308,60 @@ def build_task_email(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{subject}}</title>
+    <meta name="x-apple-disable-message-reformatting">
+    <title>{safe_subject}</title>
+    <style>
+        table {{ border-collapse: collapse; }}
+        @media only screen and (max-width: 620px) {{
+            .email-shell {{ padding: 14px 8px !important; }}
+            .email-card {{ width: 100% !important; max-width: 100% !important; border-radius: 8px !important; }}
+            .email-header {{ padding: 22px 18px 14px !important; }}
+            .email-content {{ padding: 0 18px 24px !important; }}
+            .email-footer {{ padding: 16px 18px 22px !important; }}
+            .email-title {{ font-size: 24px !important; line-height: 1.22 !important; }}
+            .status-panel {{ padding: 16px !important; }}
+            .info-label, .info-value {{ display: block !important; width: 100% !important; text-align: left !important; }}
+            .info-label {{ padding: 12px 0 3px !important; }}
+            .info-value {{ padding: 0 0 12px !important; }}
+            .log-pre {{ font-size: 11px !important; line-height: 1.58 !important; }}
+        }}
+    </style>
 </head>
-<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f5f5f7; color: #1d1d1f; -webkit-font-smoothing: antialiased;">
-    <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width: 100%; height: 100%; background-color: #f5f5f7;">
+<body style="margin: 0; padding: 0; width: 100% !important; min-width: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', sans-serif; background-color: #f4f6f9; color: #111827; -webkit-font-smoothing: antialiased; -webkit-text-size-adjust: 100%; text-size-adjust: 100%;">
+    <div style="display: none; max-height: 0; overflow: hidden; opacity: 0; color: transparent; mso-hide: all;">{status_text}: {safe_task_name}</div>
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width: 100%; min-width: 100%; background-color: #f4f6f9;">
         <tr>
-            <td align="center" style="padding: 40px 20px;">
-                <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width: 100%; max-width: 600px; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.04);">
+            <td align="center" class="email-shell" style="padding: 28px 14px;">
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" class="email-card" style="width: 100%; max-width: 560px; background-color: #ffffff; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden;">
                     <tr>
-                        <td style="padding: 40px 40px 20px; text-align: center;">
-                            <h1 style="margin: 0; font-size: 28px; font-weight: 600; color: #1d1d1f; letter-spacing: -0.5px;">LogWatch</h1>
+                        <td class="email-header" style="padding: 28px 28px 18px;">
+                            <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width: 100%;">
+                                <tr>
+                                    <td style="vertical-align: middle;">
+                                        <span style="display: inline-block; width: 9px; height: 9px; border-radius: 9px; background-color: {status_color}; vertical-align: 1px;"></span>
+                                        <span style="margin-left: 9px; font-size: 15px; font-weight: 700; color: #111827;">LogWatch</span>
+                                    </td>
+                                    <td align="right" style="vertical-align: middle;">
+                                        <span style="display: inline-block; padding: 5px 9px; border-radius: 999px; background-color: #f3f4f6; color: #6b7280; font-size: 11px; font-weight: 600;">Offline</span>
+                                    </td>
+                                </tr>
+                            </table>
                         </td>
                     </tr>
                     <tr>
-                        <td style="padding: 0 40px 40px;">
+                        <td class="email-content" style="padding: 0 28px 30px;">
                             <div>
-                                <h2 style="margin: 0 0 8px; font-size: 24px; font-weight: 600; color: {status_color}; text-align: center;">&#9679; {status_text}</h2>
-                                <p style="margin: 0 0 32px; font-size: 17px; color: #1d1d1f; text-align: center;">{safe_task_name}</p>
+                                <div class="status-panel" style="padding: 18px; background-color: #f8fafc; border: 1px solid #e5e7eb; border-left: 4px solid {status_color}; border-radius: 8px;">
+                                    <span style="display: inline-block; padding: 5px 9px; border-radius: 999px; background-color: {_email_status_tint(status_color)}; color: {status_color}; font-size: 12px; line-height: 1; font-weight: 800;">&#9679; {status_text}</span>
+                                    <h1 class="email-title" style="margin: 10px 0 0; font-size: 27px; line-height: 1.25; font-weight: 760; color: #111827; word-break: break-word;">{safe_task_name}</h1>
+                                </div>
                                 
-                                <table role="presentation" cellpadding="0" cellspacing="0" style="width: 100%; border-collapse: collapse;">
-                                    <tr>
-                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea; width: 80px;">
-                                            <span style="font-size: 14px; color: #86868b; font-weight: 500;">机器</span>
-                                        </td>
-                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea; text-align: right;">
-                                            <span style="font-size: 15px; color: #1d1d1f;">{safe_machine}</span>
-                                        </td>
-                                    </tr>
-                                    <tr>
-                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea;">
-                                            <span style="font-size: 14px; color: #86868b; font-weight: 500;">触发时间</span>
-                                        </td>
-                                        <td style="padding: 12px 0; border-bottom: 1px solid #e5e5ea; text-align: right;">
-                                            <span style="font-size: 15px; color: #1d1d1f;">{now}</span>
-                                        </td>
-                                    </tr>
+                                <table role="presentation" cellpadding="0" cellspacing="0" style="width: 100%; margin-top: 18px;">
 {metrics_rows}
                                     <tr>
                                         <td style="padding: 16px 0 0;" colspan="2">
-                                            <span style="font-size: 14px; color: #86868b; font-weight: 500; display: block; margin-bottom: 8px;">执行命令</span>
-                                            <div style="font-size: 13px; color: #1d1d1f; font-family: -apple-system, BlinkMacSystemFont, monospace; background-color: #f5f5f7; padding: 12px; border-radius: 6px; word-break: break-all;">{safe_command}</div>
+                                            <span style="font-size: 13px; color: #6b7280; font-weight: 700; display: block; margin-bottom: 8px;">执行命令</span>
+                                            <div style="padding: 12px; background-color: #0f172a; border-radius: 8px; color: #dbeafe; font-size: 12px; line-height: 1.55; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace; word-break: break-word;">{safe_command}</div>
                                         </td>
                                     </tr>
                                 </table>
@@ -338,8 +370,8 @@ def build_task_email(
                         </td>
                     </tr>
                     <tr>
-                        <td style="padding: 20px 40px 30px; background-color: #fafafa; text-align: center; border-top: 1px solid #f0f0f0;">
-                            <p style="margin: 0; font-size: 12px; color: #86868b; line-height: 1.5;">由 LogWatch 客户端离线模式发送</p>
+                        <td class="email-footer" style="padding: 18px 28px 24px; background-color: #f8fafc; border-top: 1px solid #edf0f4;">
+                            <p style="margin: 0; font-size: 12px; color: #7b8494; line-height: 1.6;">由 LogWatch 客户端离线模式发送</p>
                         </td>
                     </tr>
                 </table>
@@ -573,6 +605,8 @@ def _write_config(config: dict) -> None:
         "user_token",
         "upload_interval_seconds",
         "batch_size",
+        "batch_max_bytes",
+        "log_chunk_bytes",
         "batch_interval_ms",
         "compression_level",
         "publish_grace_seconds",
@@ -608,7 +642,17 @@ def _write_config(config: dict) -> None:
         if value == "":
             continue
         lines.append(f"{key}={value}")
-    CONFIG_PATH.write_text("\n".join(lines) + "\n")
+    content = "\n".join(lines) + "\n"
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+    finally:
+        try:
+            CONFIG_PATH.chmod(0o600)
+        except OSError:
+            pass
 
 
 def setup_config():
@@ -762,6 +806,25 @@ def _classify_conflict_response(resp: requests.Response) -> str:
     return POST_RETRYABLE_FAIL
 
 
+def _classify_not_found_response(resp: requests.Response) -> str:
+    detail_message = ""
+    detail_code = ""
+    try:
+        payload = resp.json()
+        detail = payload.get("detail") if isinstance(payload, dict) else payload
+        if isinstance(detail, dict):
+            detail_code = str(detail.get("code") or "").strip().lower()
+            detail_message = str(detail.get("message") or "").strip().lower()
+        else:
+            detail_message = str(detail or "").strip().lower()
+    except ValueError:
+        detail_message = (resp.text or "").strip().lower()
+
+    if detail_code == POST_TASK_NOT_FOUND or "task not found" in detail_message:
+        return POST_TASK_NOT_FOUND
+    return POST_RETRYABLE_FAIL
+
+
 def post_json_status_with_response(
     url: str,
     data: dict,
@@ -791,6 +854,8 @@ def post_json_status_with_response(
             resp = http.post(url, data=body, headers=headers, timeout=timeout)
         if resp.status_code == 409:
             return _classify_conflict_response(resp), None, resp.status_code
+        if resp.status_code == 404:
+            return _classify_not_found_response(resp), None, resp.status_code
         if 200 <= resp.status_code < 300:
             try:
                 return POST_OK, resp.json(), resp.status_code
@@ -868,6 +933,8 @@ def get_json_status(
             resp = http.get(url, params=params, headers=auth_headers, timeout=timeout)
         if resp.status_code == 409:
             return _classify_conflict_response(resp), None, resp.status_code
+        if resp.status_code == 404:
+            return _classify_not_found_response(resp), None, resp.status_code
         if 200 <= resp.status_code < 300:
             try:
                 return POST_OK, resp.json(), resp.status_code
@@ -898,6 +965,8 @@ class LogQueueStore:
     def __init__(self, db_path: Path):
         self._db_path = db_path
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._conn: Optional[sqlite3.Connection] = None
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -907,6 +976,23 @@ class LogQueueStore:
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA temp_store=MEMORY")
         return conn
+
+    def _get_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = self._connect()
+        return self._conn
+
+    def close(self):
+        with self._lock:
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _init_db(self):
         conn = self._connect()
@@ -938,12 +1024,12 @@ class LogQueueStore:
         conn.close()
 
     def get_next_seq(self, task_id: str, min_value: int = 1) -> int:
-        conn = self._connect()
-        row = conn.execute(
-            "SELECT COALESCE(MAX(client_seq), 0) AS max_seq FROM log_queue WHERE task_id=?",
-            (task_id,),
-        ).fetchone()
-        conn.close()
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT COALESCE(MAX(client_seq), 0) AS max_seq FROM log_queue WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
         next_seq = int(row["max_seq"]) + 1 if row else 1
         return max(next_seq, min_value)
 
@@ -957,118 +1043,157 @@ class LogQueueStore:
         status: str = "pending",
     ):
         now = datetime.now(timezone.utc).isoformat()
-        conn = self._connect()
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO log_queue
-            (task_id, user_id, client_seq, content, timestamp, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (task_id, user_id, client_seq, content, timestamp, status, now, now),
-        )
-        conn.commit()
-        conn.close()
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO log_queue
+                (task_id, user_id, client_seq, content, timestamp, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (task_id, user_id, client_seq, content, timestamp, status, now, now),
+            )
+            conn.commit()
 
     def reconcile_with_server_ack(self, task_id: str, last_ack_seq: int):
         now = datetime.now(timezone.utc).isoformat()
-        conn = self._connect()
-        conn.execute(
-            "UPDATE log_queue SET status='sent', updated_at=? WHERE task_id=? AND client_seq<=?",
-            (now, task_id, last_ack_seq),
-        )
-        conn.execute(
-            "UPDATE log_queue SET status='pending', updated_at=? WHERE task_id=? AND client_seq>? AND status='sent'",
-            (now, task_id, last_ack_seq),
-        )
-        conn.commit()
-        conn.close()
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                "UPDATE log_queue SET status='sent', updated_at=? WHERE task_id=? AND client_seq<=?",
+                (now, task_id, last_ack_seq),
+            )
+            conn.execute(
+                "UPDATE log_queue SET status='pending', updated_at=? WHERE task_id=? AND client_seq>? AND status='sent'",
+                (now, task_id, last_ack_seq),
+            )
+            conn.commit()
+            self.prune_sent(task_id)
 
     def get_pending_count(self, task_id: str) -> int:
-        conn = self._connect()
-        row = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM log_queue WHERE task_id=? AND status='pending'",
-            (task_id,),
-        ).fetchone()
-        conn.close()
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM log_queue WHERE task_id=? AND status='pending'",
+                (task_id,),
+            ).fetchone()
         return int(row["cnt"]) if row else 0
 
-    def get_pending_batch(self, task_id: str, limit: int) -> list[dict]:
-        conn = self._connect()
-        rows = conn.execute(
-            """
-            SELECT client_seq, content, timestamp
-            FROM log_queue
-            WHERE task_id=? AND status='pending'
-            ORDER BY client_seq
-            LIMIT ?
-            """,
-            (task_id, max(1, limit)),
-        ).fetchall()
-        conn.close()
-        return [dict(row) for row in rows]
+    def get_pending_batch(self, task_id: str, limit: int, max_bytes: Optional[int] = None) -> list[dict]:
+        with self._lock:
+            conn = self._get_conn()
+            rows = conn.execute(
+                """
+                SELECT client_seq, content, timestamp
+                FROM log_queue
+                WHERE task_id=? AND status='pending'
+                ORDER BY client_seq
+                LIMIT ?
+                """,
+                (task_id, max(1, limit)),
+            ).fetchall()
+        batch = []
+        used_bytes = 0
+        for row in rows:
+            item = dict(row)
+            item_bytes = len(str(item.get("content") or "").encode("utf-8"))
+            if max_bytes is not None and max_bytes > 0 and batch and used_bytes + item_bytes > max_bytes:
+                break
+            batch.append(item)
+            used_bytes += item_bytes
+        return batch
 
     def get_unsent_count(self, task_id: str) -> int:
-        conn = self._connect()
-        row = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM log_queue WHERE task_id=? AND status IN ('pending', 'failed')",
-            (task_id,),
-        ).fetchone()
-        conn.close()
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM log_queue WHERE task_id=? AND status IN ('pending', 'failed')",
+                (task_id,),
+            ).fetchone()
         return int(row["cnt"]) if row else 0
 
     def reset_failed_to_pending(self, task_id: str):
         now = datetime.now(timezone.utc).isoformat()
-        conn = self._connect()
-        conn.execute(
-            "UPDATE log_queue SET status='pending', updated_at=? WHERE task_id=? AND status='failed'",
-            (now, task_id),
-        )
-        conn.commit()
-        conn.close()
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                "UPDATE log_queue SET status='pending', updated_at=? WHERE task_id=? AND status='failed'",
+                (now, task_id),
+            )
+            conn.commit()
 
     def mark_sent_up_to(self, task_id: str, ack_seq: int):
         now = datetime.now(timezone.utc).isoformat()
-        conn = self._connect()
-        conn.execute(
-            """
-            UPDATE log_queue
-            SET status='sent', last_error=NULL, updated_at=?
-            WHERE task_id=? AND client_seq<=? AND status IN ('pending', 'failed', 'sent')
-            """,
-            (now, task_id, ack_seq),
-        )
-        conn.commit()
-        conn.close()
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                """
+                UPDATE log_queue
+                SET status='sent', last_error=NULL, updated_at=?
+                WHERE task_id=? AND client_seq<=? AND status IN ('pending', 'failed', 'sent')
+                """,
+                (now, task_id, ack_seq),
+            )
+            conn.commit()
+            self.prune_sent(task_id)
 
     def mark_failed(self, task_id: str, client_seqs: list[int], error: str):
         if not client_seqs:
             return
         now = datetime.now(timezone.utc).isoformat()
-        conn = self._connect()
-        conn.executemany(
-            """
-            UPDATE log_queue
-            SET status='failed', retry_count=retry_count+1, last_error=?, updated_at=?
-            WHERE task_id=? AND client_seq=? AND status='pending'
-            """,
-            [(error, now, task_id, seq) for seq in client_seqs],
-        )
-        conn.commit()
-        conn.close()
+        with self._lock:
+            conn = self._get_conn()
+            conn.executemany(
+                """
+                UPDATE log_queue
+                SET status='failed', retry_count=retry_count+1, last_error=?, updated_at=?
+                WHERE task_id=? AND client_seq=? AND status='pending'
+                """,
+                [(error, now, task_id, seq) for seq in client_seqs],
+            )
+            conn.commit()
 
     def archive_task(self, task_id: str, reason: str):
         now = datetime.now(timezone.utc).isoformat()
-        conn = self._connect()
-        conn.execute(
-            """
-            UPDATE log_queue
-            SET status='archived', last_error=?, updated_at=?
-            WHERE task_id=? AND status IN ('pending', 'failed', 'sent')
-            """,
-            (reason, now, task_id),
-        )
-        conn.commit()
-        conn.close()
+        with self._lock:
+            conn = self._get_conn()
+            conn.execute(
+                """
+                UPDATE log_queue
+                SET status='archived', last_error=?, updated_at=?
+                WHERE task_id=? AND status IN ('pending', 'failed', 'sent')
+                """,
+                (reason, now, task_id),
+            )
+            conn.commit()
+
+    def prune_sent(self, task_id: str, keep_rows: int = QUEUE_SENT_KEEP_ROWS) -> int:
+        keep_rows = max(0, int(keep_rows))
+        with self._lock:
+            conn = self._get_conn()
+            if keep_rows > 0:
+                deleted = conn.execute(
+                    """
+                    DELETE FROM log_queue
+                    WHERE task_id=? AND status='sent'
+                      AND id NOT IN (
+                          SELECT id FROM log_queue
+                          WHERE task_id=? AND status='sent'
+                          ORDER BY client_seq DESC
+                          LIMIT ?
+                      )
+                    """,
+                    (task_id, task_id, keep_rows),
+                ).rowcount
+            else:
+                deleted = conn.execute(
+                    "DELETE FROM log_queue WHERE task_id=? AND status='sent'",
+                    (task_id,),
+                ).rowcount
+            conn.commit()
+            if deleted >= QUEUE_CHECKPOINT_MIN_DELETED_ROWS:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            return int(deleted or 0)
 
 
 # ── 日志上传线程 ──────────────────────────────────────
@@ -1092,6 +1217,7 @@ class LogUploader:
         self.user_token = user_token
         self._auth_headers = build_user_auth_headers(user_id=user_id, user_token=user_token)
         self._offset = 0
+        self._log_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._stop = threading.Event()
         self._thread = None
         self._heartbeat_thread = None
@@ -1110,6 +1236,14 @@ class LogUploader:
             _get_int_config(config, "offline_probe_interval_seconds", OFFLINE_PROBE_INTERVAL_SECONDS),
         )
         self._batch_size = max(1, _get_int_config(config, "batch_size", BATCH_SIZE))
+        self._batch_max_bytes = min(
+            MAX_BATCH_MAX_BYTES,
+            max(1024, _get_int_config(config, "batch_max_bytes", BATCH_MAX_BYTES)),
+        )
+        self._log_chunk_bytes = min(
+            MAX_LOG_CHUNK_BYTES,
+            max(1024, _get_int_config(config, "log_chunk_bytes", LOG_CHUNK_BYTES)),
+        )
         self._batch_interval_ms = max(100, _get_int_config(config, "batch_interval_ms", BATCH_INTERVAL_MS))
         self._compression_level = _normalized_compression_level(
             _get_int_config(config, "compression_level", COMPRESSION_LEVEL)
@@ -1128,6 +1262,9 @@ class LogUploader:
 
     def get_request_lock(self) -> threading.Lock:
         return self._request_lock
+
+    def can_attempt_transport(self) -> bool:
+        return not self._task_deleted.is_set() and time.time() >= self._next_retry_at
 
     def _get_transport_state(self) -> TransportState:
         with self._state_lock:
@@ -1206,7 +1343,7 @@ class LogUploader:
             self._thread.join(timeout=5)
         if self._heartbeat_thread and self._heartbeat_thread.is_alive():
             self._heartbeat_thread.join(timeout=5)
-        self._collect_new_logs()
+        self._collect_new_logs(final=True)
         for _ in range(20):
             if self._offline.is_set() or self._task_deleted.is_set():
                 break
@@ -1219,6 +1356,7 @@ class LogUploader:
         if self._session:
             self._session.close()
             self._session = None
+        self._queue.close()
 
     def _run(self):
         loop_interval = max(0.2, min(float(self._upload_interval), 1.0))
@@ -1251,6 +1389,9 @@ class LogUploader:
         )
         if status == POST_TASK_DELETED:
             self._abandon_task_push("续传 ACK 查询")
+            return
+        if status == POST_TASK_NOT_FOUND:
+            self._reject_task_push("续传 ACK 查询", "task not found")
             return
         if status == POST_OK:
             self._mark_transport_success("续传 ACK 查询")
@@ -1287,6 +1428,8 @@ class LogUploader:
             self._mark_transport_success("心跳")
         elif status == POST_TASK_DELETED:
             self._abandon_task_push("心跳")
+        elif status == POST_TASK_NOT_FOUND:
+            self._reject_task_push("心跳", "task not found")
         elif status == POST_TASK_NOT_RUNNING:
             self._mark_retryable_failure("心跳", count_towards_giveup=False)
         else:
@@ -1321,6 +1464,9 @@ class LogUploader:
     def mark_task_id_conflict(self, source: str):
         self._reject_task_push(source, "task_id conflict")
 
+    def mark_task_not_found(self, source: str):
+        self._reject_task_push(source, "task not found")
+
     def mark_transport_success(self, source: str):
         self._mark_transport_success(source)
 
@@ -1336,23 +1482,9 @@ class LogUploader:
     def is_offline(self) -> bool:
         return self._get_transport_state() in (TransportState.OFFLINE_GIVEUP, TransportState.TASK_DELETED)
 
-    def _collect_new_logs(self):
-        try:
-            with open(self.log_file, "rb") as f:
-                f.seek(self._offset)
-                chunk = f.read()
-            if not chunk:
-                return
-        except FileNotFoundError:
+    def _enqueue_log_content(self, content: str, timestamp: str):
+        if not content:
             return
-        except Exception:
-            return
-
-        try:
-            content = chunk.decode("utf-8", errors="replace")
-        except Exception:
-            content = chunk.decode("latin-1")
-        timestamp = datetime.now(timezone.utc).isoformat()
         row_status = "archived" if self._task_deleted.is_set() else "pending"
         client_seq = self._next_seq
         self._queue.enqueue(
@@ -1364,9 +1496,38 @@ class LogUploader:
             status=row_status,
         )
         self._next_seq += 1
-        self._offset += len(chunk)
         if row_status == "pending" and self._pending_since <= 0:
             self._pending_since = time.time()
+
+    def _collect_new_logs(self, final: bool = False):
+        timestamp = datetime.now(timezone.utc).isoformat()
+        read_any = False
+        try:
+            f = open(self.log_file, "rb")
+        except FileNotFoundError:
+            return
+        except Exception:
+            return
+
+        with f:
+            f.seek(self._offset)
+            while True:
+                try:
+                    chunk = f.read(self._log_chunk_bytes)
+                except Exception:
+                    return
+                if not chunk:
+                    break
+                read_any = True
+                content = self._log_decoder.decode(chunk, final=False)
+                self._enqueue_log_content(content, timestamp)
+                self._offset += len(chunk)
+
+        if final or read_any:
+            tail = self._log_decoder.decode(b"", final=final)
+            self._enqueue_log_content(tail, timestamp)
+            if final:
+                self._log_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     def _flush_batch(self, force: bool = False):
         if self._offline.is_set() or self._task_deleted.is_set():
@@ -1386,11 +1547,24 @@ class LogUploader:
             if (now - self._pending_since) * 1000 < self._batch_interval_ms:
                 return
 
-        batch = self._queue.get_pending_batch(self.task_id, self._batch_size)
+        batch = self._queue.get_pending_batch(self.task_id, self._batch_size, max_bytes=self._batch_max_bytes)
         if not batch:
             return
 
-        status, payload, _code = post_json_status_with_response(
+        result = self._upload_batch_with_split(batch)
+        if result == POST_OK:
+            if self._queue.get_pending_count(self.task_id) > 0:
+                self._pending_since = time.time()
+            else:
+                self._pending_since = 0.0
+            return
+        if result in (POST_TASK_DELETED, POST_TASK_NOT_FOUND):
+            return
+
+        self._mark_retryable_failure("日志上传", count_towards_giveup=False)
+
+    def _post_log_batch(self, batch: list[dict]) -> tuple[str, Optional[dict], int]:
+        return post_json_status_with_response(
             f"{self.server}/api/log/batch",
             {
                 "task_id": self.task_id,
@@ -1404,6 +1578,9 @@ class LogUploader:
             session=self._session,
             request_lock=self._request_lock,
         )
+
+    def _upload_batch_with_split(self, batch: list[dict]) -> str:
+        status, payload, _code = self._post_log_batch(batch)
         if status == POST_OK:
             try:
                 ack_seq = int((payload or {}).get("ack_seq", batch[-1]["client_seq"]) or 0)
@@ -1412,22 +1589,27 @@ class LogUploader:
             self._queue.mark_sent_up_to(self.task_id, ack_seq)
             self._last_ack_seq = max(self._last_ack_seq, ack_seq)
             self._mark_transport_success("日志上传")
-            if self._queue.get_pending_count(self.task_id) > 0:
-                self._pending_since = time.time()
-            else:
-                self._pending_since = 0.0
-            return
+            return POST_OK
 
         if status == POST_TASK_DELETED:
             self._abandon_task_push("批量日志上报")
-            return
+            return POST_TASK_DELETED
+        if status == POST_TASK_NOT_FOUND:
+            self._reject_task_push("批量日志上报", "task not found")
+            return POST_TASK_NOT_FOUND
+        if _code == 413 and len(batch) > 1:
+            midpoint = max(1, len(batch) // 2)
+            left_status = self._upload_batch_with_split(batch[:midpoint])
+            if left_status != POST_OK:
+                return left_status
+            return self._upload_batch_with_split(batch[midpoint:])
 
         self._queue.mark_failed(
             self.task_id,
             [int(item["client_seq"]) for item in batch],
             "batch upload failed",
         )
-        self._mark_retryable_failure("日志上传", count_towards_giveup=False)
+        return POST_RETRYABLE_FAIL
 
 
 # ── 事件上报 ──────────────────────────────────────────
@@ -1508,6 +1690,12 @@ def send_event_status(server: str, task_id: str, user_id: str, user_token: str, 
             else:
                 print_lw_message("任务 ID 与已有任务冲突，当前任务不会继续上报", color="33")
             return POST_TASK_ID_CONFLICT
+        if status == POST_TASK_NOT_FOUND:
+            if uploader:
+                uploader.mark_task_not_found("事件上报")
+            else:
+                print_lw_message("任务不存在，当前任务不会继续上报", color="33")
+            return POST_TASK_NOT_FOUND
         if uploader:
             uploader.mark_retryable_failure("事件上报", count_towards_giveup=False)
         if i < retries - 1:
@@ -1745,6 +1933,52 @@ def main():
     exit_code = 1
     task_pid: Optional[int] = None
     publish_deadline = start_time + max(0, publish_grace_seconds)
+    exec_ok = False
+    start_event_status = POST_OK
+
+    def publish_start_event(force: bool = False) -> str:
+        nonlocal published, uploader_started, email_start_sent, start_event_status
+        if published:
+            return POST_OK
+
+        if offline_mode:
+            if not email_start_sent and email_config:
+                send_task_start_email(email_config, task_name, machine, command_str)
+                email_start_sent = True
+            published = True
+            return POST_OK
+
+        if uploader and uploader.is_task_deleted():
+            return start_event_status if start_event_status != POST_OK else POST_TASK_DELETED
+
+        if uploader and not force and not uploader.can_attempt_transport():
+            return POST_RETRYABLE_FAIL
+
+        status = send_event_status(
+            server,
+            task_id,
+            user_id,
+            user_token or "",
+            "start",
+            task_name,
+            machine,
+            command_str,
+            heartbeat_interval=uploader._heartbeat_interval if uploader else 30,
+            uploader=uploader,
+            cwd=command_cwd,
+            pid=task_pid,
+            python_version=task_python_version,
+        )
+        start_event_status = status
+        if status != POST_OK:
+            print_lw_message("警告: 无法上报任务开始事件", color="33")
+            return status
+
+        published = True
+        if uploader and not uploader_started:
+            uploader.start()
+            uploader_started = True
+        return POST_OK
 
     try:
         # 先 fork 执行命令，在 fork 之后再启动线程和网络请求，避免线程+fork 问题
@@ -1790,35 +2024,13 @@ def main():
             task_pid = child_pid
             child_terminated = False
             exec_checked = False
-            exec_ok = False
 
             def maybe_publish():
-                nonlocal published, uploader_started, email_start_sent
                 if not exec_ok:
                     return
                 if time.time() < publish_deadline:
                     return
-
-                # 离线模式：发送开始邮件
-                if offline_mode:
-                    if not email_start_sent and email_config:
-                        send_task_start_email(email_config, task_name, machine, command_str)
-                        email_start_sent = True
-                    published = True
-                    return
-
-                # 在线模式：上传到服务器
-                if published:
-                    return
-                if uploader and not uploader_started:
-                    uploader.start()
-                    uploader_started = True
-                if not send_event(server, task_id, user_id, user_token or "", "start", task_name, machine, command_str,
-                                  heartbeat_interval=uploader._heartbeat_interval if uploader else 30,
-                                  uploader=uploader, cwd=command_cwd,
-                                  pid=task_pid, python_version=task_python_version):
-                    print_lw_message("警告: 无法上报任务开始事件", color="33")
-                published = True
+                publish_start_event()
 
             # 设置信号处理
             original_sigint = signal.getsignal(signal.SIGINT)
@@ -1930,15 +2142,7 @@ def main():
     elapsed = time.time() - start_time
 
     if not published and not offline_mode and exec_ok and elapsed >= publish_grace_seconds:
-        if uploader and not uploader_started:
-            uploader.start()
-            uploader_started = True
-        if not send_event(
-            server, task_id, user_id, user_token or "", "start", task_name, machine, command_str,
-            uploader=uploader, cwd=command_cwd, pid=task_pid, python_version=task_python_version
-        ):
-            print_lw_message("警告: 无法上报任务开始事件", color="33")
-        published = True
+        publish_start_event(force=True)
 
     # 停止上传（会做最后一次上传）
     if uploader and uploader_started:
@@ -1951,7 +2155,11 @@ def main():
 
     # 上报任务结束
     event_type = "success" if exit_code == 0 else "failed"
-    final_event_status = POST_OK
+    final_event_status = (
+        POST_RETRYABLE_FAIL
+        if not published and start_event_status == POST_RETRYABLE_FAIL and exec_ok and elapsed >= publish_grace_seconds
+        else POST_OK
+    )
     if published and not offline_mode:
         final_event_status = send_event_status(
             server, task_id, user_id, user_token or "", event_type, task_name, machine, command_str, exit_code,
