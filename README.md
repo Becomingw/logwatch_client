@@ -316,6 +316,58 @@ email_to=notify@example.com
 
 ---
 
+<br>
+
+<details>
+<summary><b>🤖 LogWatch Monitor Skill — AI 助手任务监控</b></summary>
+
+<br>
+
+客户端内置了 `skills/logwatch-monitor` 技能，供 Codex / Claude Code 等 AI 助手直接查询任务状态与日志，无需打开浏览器。
+
+### 功能一览
+
+| 模式 | 命令子项 | 说明 |
+| :--- | :--- | :--- |
+| 仪表盘 | `dashboard` | 任务概况、成功率、活跃度、连续运行天数 |
+| 任务列表 | `summary` | 按状态分组统计，列出关键任务 |
+| 任务详情 | `task` | 单任务生命周期字段与健康指标 |
+| 增量日志 | `log` | 支持 `--after-id` 续传和 `--latest N` 快速尾部查看 |
+| 状态历史 | `history` | 状态变迁时间线（何时断连、恢复等） |
+| 关键词搜索 | `search` | 按项目关键词（如 `nnunet`、`liver`）智能定位任务 |
+| 删除任务 | `delete` | 通过 AI 助手删除指定任务 |
+| 持续监控 | `watch` | 轮询模式，定时拉取任务状态变化 |
+
+### 使用方式
+
+```bash
+# 任务概况
+python3 skills/logwatch-monitor/scripts/logwatch_api_monitor.py summary \
+  --server http://127.0.0.1:8000 --user-id 104698 --user-token ut_xxx
+
+# 智能搜索
+python3 skills/logwatch-monitor/scripts/logwatch_api_monitor.py search \
+  --server http://127.0.0.1:8000 --user-id 104698 --user-token ut_xxx \
+  --query "nnunet liver" --with-log --limit 5
+
+# 增量日志
+python3 skills/logwatch-monitor/scripts/logwatch_api_monitor.py log \
+  --server http://127.0.0.1:8000 --user-id 104698 --user-token ut_xxx \
+  --task-id <task_id> --after-id 0 --limit 200
+
+# 仪表盘概览
+python3 skills/logwatch-monitor/scripts/logwatch_api_monitor.py dashboard \
+  --server http://127.0.0.1:8000 --user-id 104698 --user-token ut_xxx
+```
+
+> 详细 API 字段说明见 `skills/logwatch-monitor/references/api-reference.md`。
+
+</details>
+
+<br>
+
+---
+
 <div align="center">
 
 ```

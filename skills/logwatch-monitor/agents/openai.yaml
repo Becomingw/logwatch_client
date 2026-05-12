@@ -1,0 +1,4 @@
+interface:
+  display_name: "LogWatch Monitor"
+  short_description: "Monitor LogWatch task status and inspect specific runs."
+  default_prompt: "Use LogWatch APIs to monitor my task status, query a specific task, and summarize recent runtime changes."
